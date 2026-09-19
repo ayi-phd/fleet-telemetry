@@ -1,0 +1,15 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+# Written by deploy.sh; holds region and image tag for destroy.sh
+deploy.auto.tfvars.json
+*.tfvars
+!example.tfvars
+
+# Build output
+.build-*.log
+services/gen/
+web/node_modules/
+web/dist/

@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package authz.v1;
+
+option go_package = "github.com/example/fleet-telemetry/gen/authz/v1;authzv1";
+
+service AuthzService {
+  // Returns everything the user may see. Used by dashboard-api to build routing interest.
+  rpc GetUserScope(GetUserScopeRequest) returns (UserScope);
+  // Point check for a single fleet/vehicle.
+  rpc CheckAccess(CheckAccessRequest) returns (CheckAccessResponse);
+}
+
+message GetUserScopeRequest {
+  string user_id = 1;
+}
+
+message UserScope {
+  string user_id = 1;
+  bool all_fleets = 2;
+  repeated string fleet_ids = 3;
+  repeated string vins = 4;
+}
+
+message CheckAccessRequest {
+  string user_id = 1;
+  string fleet_id = 2;
+  string vin = 3;
+}
+
+message CheckAccessResponse {
+  bool allowed = 1;
+}

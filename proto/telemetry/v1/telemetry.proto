@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+// Wire format published by vehicles on MQTT topic "fleet/telemetry".
+package telemetry.v1;
+
+option go_package = "github.com/example/fleet-telemetry/gen/telemetry/v1;telemetryv1";
+
+enum VehicleStatus {
+  VEHICLE_STATUS_UNSPECIFIED = 0;
+  VEHICLE_STATUS_PARKED = 1;
+  VEHICLE_STATUS_DRIVING = 2;
+  VEHICLE_STATUS_CHARGING = 3;
+  VEHICLE_STATUS_IDLE = 4;
+  VEHICLE_STATUS_FAULT = 5;
+}
+
+message VehicleTelemetry {
+  string vin = 1;               // 17-char VIN; also used as the MQTT client id / IoT thing name
+  double lng = 2;               // WGS84 longitude
+  double lat = 3;               // WGS84 latitude
+  VehicleStatus status = 4;
+  float battery_soc = 5;        // state of charge, 0..100 %
+  int64 device_timestamp = 6;   // unix epoch milliseconds, device clock
+}

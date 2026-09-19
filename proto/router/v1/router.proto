@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+// Internal contract between dashboard-api (client) and realtime-router (server).
+// Each dashboard-api pod opens one bidirectional stream to EVERY realtime-router pod
+// and continuously declares the union of what its connected users may see.
+// The router only forwards events matching that interest.
+package router.v1;
+
+option go_package = "github.com/example/fleet-telemetry/gen/router/v1;routerv1";
+
+service RealtimeRouter {
+  rpc Subscribe(stream SubscribeRequest) returns (stream TelemetryEvent);
+}
+
+message SubscribeRequest {
+  oneof msg {
+    Hello hello = 1;             // must be the first message on the stream
+    InterestUpdate interest = 2; // may be sent any number of times; replaces previous interest
+  }
+}
+
+message Hello {
+  string subscriber_id = 1;      // dashboard-api pod name
+}
+
+message InterestUpdate {
+  bool all = 1;                  // at least one connected user is an admin
+  repeated string fleet_ids = 2;
+  repeated string vins = 3;
+  uint64 version = 4;
+}
+
+message TelemetryEvent {
+  string vin = 1;
+  string fleet_id = 2;
+  bytes canonical_json = 3;      // canonical event, forwarded verbatim to browsers
+}
