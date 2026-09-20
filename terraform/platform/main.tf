@@ -40,6 +40,10 @@ resource "kubernetes_secret_v1" "platform" {
     POSTGRES_DSN    = local.infra.postgres_dsn
     JWT_SIGNING_KEY = random_password.jwt.result
     DEMO_PASSWORD   = random_password.demo_users.result
+    # Only consumed on Floci (see realtime_router/dashboard_api's secret_env below):
+    # Floci has no IRSA, so these stand in as static OpenSearch credentials there.
+    AWS_ACCESS_KEY_ID     = var.floci_deploy_access_key_id
+    AWS_SECRET_ACCESS_KEY = var.floci_deploy_secret_access_key
   }
 }
 
@@ -73,6 +77,12 @@ locals {
     secret_name = kubernetes_secret_v1.platform.metadata[0].name
   }
   kafka_secrets = ["KAFKA_BROKERS", "KAFKA_USERNAME", "KAFKA_PASSWORD"]
+  # OpenSearch credentials for realtime-router and dashboard-api. On AWS these env
+  # vars are omitted entirely so the AWS SDK's default chain falls through to IRSA;
+  # setting them to empty strings there would instead break IRSA outright, since the
+  # SDK treats a present-but-empty AWS_ACCESS_KEY_ID as a (broken) static credential
+  # rather than "unset". No IRSA on Floci (see infra/iam_pods.tf), so it uses these.
+  opensearch_secret_env = local.floci ? ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] : []
 }
 
 # ---------------- rbac-authz: users, grants, vehicle->fleet master data ----------------
@@ -131,11 +141,11 @@ module "realtime_router" {
   replicas               = local.replicas.realtime_router
   ports                  = { grpc = 9090 }
   node_selector          = { workload = "core" }
-  create_service_account = true # bound to the OpenSearch IAM role via IRSA
-  service_account_annotations = {
+  create_service_account = true # bound to the OpenSearch IAM role via IRSA (AWS only)
+  service_account_annotations = local.floci ? {} : {
     "eks.amazonaws.com/role-arn" = local.infra.realtime_router_role_arn
   }
-  secret_env = local.kafka_secrets
+  secret_env = concat(local.kafka_secrets, local.opensearch_secret_env)
   env = {
     PUSH_GROUP    = "realtime-router-push"
     PERSIST_GROUP = "realtime-router-persist"
@@ -154,11 +164,11 @@ module "dashboard_api" {
   image                  = local.image["dashboard-api"]
   replicas               = local.replicas.dashboard_api
   ports                  = { http = 8080 }
-  create_service_account = true # bound to the OpenSearch IAM role via IRSA
-  service_account_annotations = {
+  create_service_account = true # bound to the OpenSearch IAM role via IRSA (AWS only)
+  service_account_annotations = local.floci ? {} : {
     "eks.amazonaws.com/role-arn" = local.infra.dashboard_api_role_arn
   }
-  secret_env    = ["JWT_SIGNING_KEY"]
+  secret_env    = concat(["JWT_SIGNING_KEY"], local.opensearch_secret_env)
   node_selector = { workload = "edge" }
   tolerations   = [{ key = "dedicated", value = "edge", effect = "NoSchedule" }]
   env = {

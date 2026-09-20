@@ -264,6 +264,12 @@ resource "kubernetes_deployment_v1" "this" {
           }
 
           security_context {
+            # The Kubernetes provider serializes an omitted run_as_non_root in a
+            # container-level block as an explicit false, which overrides the pod-level
+            # true above and violates the namespace's "restricted" Pod Security
+            # Standard - confirmed on a live Floci run (PLAN.md Phase 4), and this
+            # would fail identically on real AWS.
+            run_as_non_root            = true
             allow_privilege_escalation = false
             read_only_root_filesystem  = true
             capabilities {

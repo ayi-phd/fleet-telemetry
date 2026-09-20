@@ -66,6 +66,9 @@ resource "kubernetes_deployment_v1" "web" {
             period_seconds = 10
           }
           security_context {
+            # See modules/service/main.tf: an omitted run_as_non_root here is
+            # serialized as an explicit false, overriding the pod-level true.
+            run_as_non_root            = true
             allow_privilege_escalation = false
             capabilities {
               drop = ["ALL"]

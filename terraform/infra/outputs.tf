@@ -19,14 +19,15 @@ output "kubernetes_namespace" {
 }
 
 output "ecr_registry" {
-  # Derived from a real repository URL instead of reconstructing AWS's DNS pattern by
-  # hand, so this is correct on Floci too, whatever hostname/port style it uses
-  # (default is a *.dkr.ecr.<region>.localhost:<port> hostname; see PLAN.md Phase 4 for
-  # the FLOCI_SERVICES_ECR_URI_STYLE=path fallback if that doesn't work).
-  value = join("/", slice(
-    split("/", values(aws_ecr_repository.this)[0].repository_url),
-    0, length(split("/", values(aws_ecr_repository.this)[0].repository_url)) - 1
-  ))
+  # The bare registry host: everything before the first "/" in a real repository_url
+  # (whose path is "<project>/<reponame>", two segments - not one, which a previous
+  # version of this output got wrong by stripping only the last segment, leaving the
+  # project name doubled up when deploy.sh appended "$PROJECT/$repo" on top of it).
+  # Derived instead of reconstructing AWS's DNS pattern by hand, so this is correct on
+  # Floci too, whatever hostname/port style it uses (default is a
+  # *.dkr.ecr.<region>.localhost:<port> hostname; see PLAN.md Phase 4 for the
+  # FLOCI_SERVICES_ECR_URI_STYLE=path fallback if that doesn't work).
+  value = split("/", values(aws_ecr_repository.this)[0].repository_url)[0]
 }
 
 output "ecr_repository_urls" {
@@ -47,9 +48,14 @@ output "msk_password" {
 }
 
 output "redis_address" {
-  # Floci fills only the configuration endpoint for cluster-mode-disabled replication
-  # groups (floci-io/floci #2618, #2769), leaving primary_endpoint_address empty.
-  value = "${coalesce(aws_elasticache_replication_group.this.primary_endpoint_address, aws_elasticache_replication_group.this.configuration_endpoint_address)}:6379"
+  # Floci returns literally "localhost" for primary_endpoint_address - which is wrong
+  # for a pod (it resolves to the pod's own loopback, not Floci's Redis container) -
+  # confirmed on a live run (PLAN.md Phase 4). Use its real container-name hostname on
+  # Floci instead (deploy.sh patches it into /etc/hosts on the EKS node, the same way
+  # as for OpenSearch and the ECR registry, since Floci's containers have no embedded
+  # DNS between them). AWS: unaffected; still a coalesce for the documented
+  # cluster-mode-disabled quirk (floci-io/floci #2618, #2769) in case it recurs there.
+  value = local.floci ? "floci-valkey-${local.name}:6379" : "${coalesce(aws_elasticache_replication_group.this.primary_endpoint_address, aws_elasticache_replication_group.this.configuration_endpoint_address)}:6379"
 }
 
 output "redis_auth_token" {
@@ -63,14 +69,15 @@ output "postgres_dsn" {
 }
 
 output "opensearch_endpoint" {
-  # Floci's OpenSearch emulation is not expected to serve HTTPS; scheme (and possibly
-  # port) here is a best guess to be corrected on the first Floci run (PLAN.md Phase 4).
-  value = local.floci ? "http://${aws_opensearch_domain.this.endpoint}" : "https://${aws_opensearch_domain.this.endpoint}"
+  # Floci's OpenSearch container serves plain HTTP; confirmed on a live run that pods
+  # reach it at this container-name hostname on Floci's Docker network (PLAN.md Phase 4).
+  value      = local.floci ? "http://floci-opensearch-${local.name}:9200" : "https://${aws_opensearch_domain.this[0].endpoint}"
+  depends_on = [null_resource.opensearch_floci]
 }
 
 output "opensearch_dashboards_url" {
-  description = "Reachable only from inside the VPC (e.g. kubectl port-forward via a pod)."
-  value       = "https://${aws_opensearch_domain.this.dashboard_endpoint}"
+  description = "Reachable only from inside the VPC (e.g. kubectl port-forward via a pod). Empty on Floci: it runs only the OpenSearch engine, not the separate Dashboards UI."
+  value       = local.floci ? "" : "https://${aws_opensearch_domain.this[0].dashboard_endpoint}"
 }
 
 output "iot_endpoint" {
