@@ -5,6 +5,7 @@ resource "random_password" "redis" {
 }
 
 resource "aws_elasticache_subnet_group" "this" {
+  count      = local.floci ? 0 : 1
   name       = local.name
   subnet_ids = module.vpc.private_subnets
 }
@@ -16,17 +17,19 @@ resource "aws_elasticache_replication_group" "this" {
   engine_version       = "7.1"
   parameter_group_name = "default.redis7"
   node_type            = var.redis_node_type
-  num_cache_clusters   = 2
+  num_cache_clusters   = local.floci ? 1 : 2
   port                 = 6379
 
-  automatic_failover_enabled = true
-  multi_az_enabled           = true
-  subnet_group_name          = aws_elasticache_subnet_group.this.name
+  # Floci: CreateCacheSubnetGroup is unsupported, and a single node can't fail over.
+  automatic_failover_enabled = !local.floci
+  multi_az_enabled           = !local.floci
+  subnet_group_name          = local.floci ? null : aws_elasticache_subnet_group.this[0].name
   security_group_ids         = [aws_security_group.redis.id]
 
-  at_rest_encryption_enabled = true
-  transit_encryption_enabled = true
-  auth_token                 = random_password.redis.result
+  # An auth token requires transit encryption; both are AWS-only.
+  at_rest_encryption_enabled = !local.floci
+  transit_encryption_enabled = !local.floci
+  auth_token                 = local.floci ? null : random_password.redis.result
   apply_immediately          = true
 }
 
@@ -80,10 +83,13 @@ resource "aws_opensearch_domain" "this" {
 
   cluster_config {
     instance_type          = var.opensearch_instance_type
-    instance_count         = 2
-    zone_awareness_enabled = true
-    zone_awareness_config {
-      availability_zone_count = 2
+    instance_count         = local.floci ? 1 : 2
+    zone_awareness_enabled = !local.floci
+    dynamic "zone_awareness_config" {
+      for_each = local.floci ? [] : [1]
+      content {
+        availability_zone_count = 2
+      }
     }
   }
 
@@ -93,20 +99,35 @@ resource "aws_opensearch_domain" "this" {
     volume_size = 20
   }
 
-  vpc_options {
-    subnet_ids         = slice(module.vpc.private_subnets, 0, 2)
-    security_group_ids = [aws_security_group.opensearch.id]
+  # Floci: VPC-attached domains aren't expected to work, so the domain is public there
+  # (fine for a single-developer local emulator with no real network exposure); IAM
+  # access_policies below still restrict it to the two pod roles on both targets.
+  dynamic "vpc_options" {
+    for_each = local.floci ? [] : [1]
+    content {
+      subnet_ids         = slice(module.vpc.private_subnets, 0, 2)
+      security_group_ids = [aws_security_group.opensearch.id]
+    }
   }
 
-  encrypt_at_rest {
-    enabled = true
+  dynamic "encrypt_at_rest" {
+    for_each = local.floci ? [] : [1]
+    content {
+      enabled = true
+    }
   }
-  node_to_node_encryption {
-    enabled = true
+  dynamic "node_to_node_encryption" {
+    for_each = local.floci ? [] : [1]
+    content {
+      enabled = true
+    }
   }
-  domain_endpoint_options {
-    enforce_https       = true
-    tls_security_policy = "Policy-Min-TLS-1-2-2019-07"
+  dynamic "domain_endpoint_options" {
+    for_each = local.floci ? [] : [1]
+    content {
+      enforce_https       = true
+      tls_security_policy = "Policy-Min-TLS-1-2-2019-07"
+    }
   }
 
   # IAM-based access: only the pod roles below may call the domain (SigV4).

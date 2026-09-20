@@ -23,7 +23,7 @@ module "vpc" {
   private_subnets = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, i)]      # /20 each
   public_subnets  = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 48)] # /24 each
 
-  enable_nat_gateway   = true
+  enable_nat_gateway   = !local.floci # Floci: CreateNatGateway is unsupported
   single_nat_gateway   = var.single_nat_gateway
   enable_dns_hostnames = true
   enable_dns_support   = true

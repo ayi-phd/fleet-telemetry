@@ -188,6 +188,45 @@ With default sizes in us-west-2, on-demand pricing, the stack costs roughly **$0
 MSK (3 brokers), the EKS control plane, OpenSearch and ElastiCache. Run `./destroy.sh` when
 you're done.
 
+## Running on Floci
+
+The same code and the same two scripts also run against [Floci](https://floci.io), a local
+AWS emulator, for development without any AWS cost. `deploy.sh` never starts Floci itself —
+it expects one already running and configured, and tells you exactly what's missing if not:
+
+```bash
+TARGET=floci ./deploy.sh
+```
+
+Required before running it:
+
+- Floci reachable (default `http://localhost:4566`; override with `FLOCI_ENDPOINT`).
+- k3s and Floci sharing a Docker network, and `FLOCI_TLS_ENABLED=true` (IoT publishes over
+  TLS on 8883).
+- `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS` set to a hostname pods can resolve — the Floci
+  container name works; `deploy.sh` assumes `floci` unless `FLOCI_IOT_ENDPOINT` says otherwise.
+- Docker Desktop with roughly 12 GB of memory available.
+
+What's different on Floci, all switched by the same `target` Terraform variable: one broker
+each for MSK, ElastiCache and OpenSearch, no NAT gateway, no EKS node groups (k3s runs every
+pod on its single node), plaintext Kafka and Redis, one replica per service, and the
+dashboard reachable by port-forward instead of a load balancer:
+
+```bash
+kubectl -n fleet port-forward svc/web 8080:80   # deploy.sh prints this exact command
+```
+
+Tear it down the same way, targeting the same Floci:
+
+```bash
+TARGET=floci ./destroy.sh   # Floci itself keeps running
+```
+
+A few pieces of this are best guesses until verified against a real Floci run (see PLAN.md
+Phase 4): OpenSearch's scheme/port, whether pods can resolve the addresses Floci hands back
+for MSK/RDS/ElastiCache/OpenSearch, and the ECR registry hostname's exact form. `deploy.sh`
+will fail with a clear error at whichever step needs a fallback if one of these doesn't hold.
+
 ## Local dashboard development
 
 Point the Vite dev server at a deployed stack; it proxies `/api` and `/auth`:

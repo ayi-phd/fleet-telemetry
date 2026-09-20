@@ -3,6 +3,8 @@ locals {
   project = local.infra.cluster_name # account/region-scoped name, e.g. for IAM and Lambda
   floci   = var.target == "floci"
   image   = { for k, url in local.infra.ecr_repository_urls : k => "${url}:${var.image_tag}" }
+  # One replica per service on Floci; var.replicas.* everywhere else.
+  replicas = local.floci ? { for k, v in var.replicas : k => 1 } : var.replicas
 }
 
 resource "kubernetes_namespace_v1" "fleet" {
@@ -31,7 +33,7 @@ resource "kubernetes_secret_v1" "platform" {
     namespace = kubernetes_namespace_v1.fleet.metadata[0].name
   }
   data = {
-    KAFKA_BROKERS   = local.infra.msk_bootstrap_brokers_scram
+    KAFKA_BROKERS   = local.infra.msk_bootstrap_brokers
     KAFKA_USERNAME  = local.infra.msk_username
     KAFKA_PASSWORD  = local.infra.msk_password
     REDIS_PASSWORD  = local.infra.redis_auth_token
@@ -57,7 +59,10 @@ resource "kubernetes_config_map_v1" "platform" {
     # 0 on Floci: its single-node OpenSearch domain can't allocate a replica shard,
     # which would otherwise leave every index permanently yellow.
     OPENSEARCH_INDEX_REPLICAS = local.floci ? "0" : "1"
-    LOG_LEVEL                 = "info"
+    # Floci: plaintext Kafka/Redis (no TLS support assumed until proven otherwise).
+    KAFKA_TLS = local.floci ? "false" : "true"
+    REDIS_TLS = local.floci ? "false" : "true"
+    LOG_LEVEL = "info"
   }
 }
 
@@ -78,7 +83,7 @@ module "rbac_authz" {
   config_map    = local.common.config_map
   secret_name   = local.common.secret_name
   image         = local.image["rbac-authz"]
-  replicas      = var.replicas.rbac_authz
+  replicas      = local.replicas.rbac_authz
   ports         = { http = 8080, grpc = 9090 }
   node_selector = { workload = "core" }
   secret_env    = ["POSTGRES_DSN", "REDIS_PASSWORD", "JWT_SIGNING_KEY", "DEMO_PASSWORD"]
@@ -96,16 +101,18 @@ module "telemetry_processor" {
   config_map    = local.common.config_map
   secret_name   = local.common.secret_name
   image         = local.image["telemetry-processor"]
-  replicas      = var.replicas.telemetry_processor
+  replicas      = local.replicas.telemetry_processor
   node_selector = { workload = "core" }
   secret_env    = concat(local.kafka_secrets, ["REDIS_PASSWORD"])
   env = {
-    CONSUMER_GROUP            = "telemetry-processor"
-    DEDUP_TTL                 = "1h"
-    TOPIC_PARTITIONS          = "6"
-    TOPIC_REPLICATION         = "3"
-    TOPIC_RETENTION           = "72h"
-    TOPIC_MIN_INSYNC_REPLICAS = "2"
+    CONSUMER_GROUP   = "telemetry-processor"
+    DEDUP_TTL        = "1h"
+    TOPIC_PARTITIONS = "6"
+    TOPIC_RETENTION  = "72h"
+    # Floci's MSK emulation has a single broker: replication (and so min.insync.replicas)
+    # can't exceed 1 there.
+    TOPIC_REPLICATION         = local.floci ? "1" : "3"
+    TOPIC_MIN_INSYNC_REPLICAS = local.floci ? "1" : "2"
   }
   # Fleet lookups need rbac-authz's initial Redis sync.
   depends_on = [module.rbac_authz]
@@ -121,7 +128,7 @@ module "realtime_router" {
   config_map             = local.common.config_map
   secret_name            = local.common.secret_name
   image                  = local.image["realtime-router"]
-  replicas               = var.replicas.realtime_router
+  replicas               = local.replicas.realtime_router
   ports                  = { grpc = 9090 }
   node_selector          = { workload = "core" }
   create_service_account = true # bound to the OpenSearch IAM role via IRSA
@@ -145,7 +152,7 @@ module "dashboard_api" {
   config_map             = local.common.config_map
   secret_name            = local.common.secret_name
   image                  = local.image["dashboard-api"]
-  replicas               = var.replicas.dashboard_api
+  replicas               = local.replicas.dashboard_api
   ports                  = { http = 8080 }
   create_service_account = true # bound to the OpenSearch IAM role via IRSA
   service_account_annotations = {
