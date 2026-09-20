@@ -46,7 +46,7 @@ variable "node_selector" {
   default = { workload = "core" }
 }
 variable "tolerations" {
-  type = list(object({ key = string, value = string, effect = string }))
+  type    = list(object({ key = string, value = string, effect = string }))
   default = []
 }
 variable "secret_volume" {

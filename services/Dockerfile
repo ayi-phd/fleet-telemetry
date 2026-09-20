@@ -3,7 +3,7 @@
 #   docker buildx build -f services/Dockerfile --build-arg SERVICE=telemetry-processor .
 # The build stage runs on the builder's native platform and cross-compiles, so an
 # arm64 laptop produces amd64 images for the EKS nodes without QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 ARG SERVICE
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -21,7 +21,7 @@ RUN protoc -I ../proto \
       --go-grpc_out=. --go-grpc_opt=module=github.com/example/fleet-telemetry \
       ../proto/telemetry/v1/telemetry.proto ../proto/router/v1/router.proto ../proto/authz/v1/authz.proto
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    go mod tidy && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
+    go mod download && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/app /app

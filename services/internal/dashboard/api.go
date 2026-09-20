@@ -13,16 +13,15 @@ import (
 )
 
 type API struct {
-	JWTKey        []byte
-	Authz         authzv1.AuthzServiceClient
-	Broker        *Broker
-	OS            *platform.OpenSearch
-	IndexPattern  string
-	Heartbeat     time.Duration
-	ScopeRefresh  time.Duration
-	Log           *slog.Logger
+	JWTKey       []byte
+	Authz        authzv1.AuthzServiceClient
+	Broker       *Broker
+	OS           *platform.OpenSearch
+	IndexPattern string
+	Heartbeat    time.Duration
+	ScopeRefresh time.Duration
+	Log          *slog.Logger
 }
-
 
 func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
