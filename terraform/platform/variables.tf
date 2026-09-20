@@ -4,6 +4,16 @@ variable "image_tag" {
   default     = "latest"
 }
 
+variable "target" {
+  description = "Deployment target: \"aws\" or \"floci\". Set by deploy.sh."
+  type        = string
+  default     = "aws"
+  validation {
+    condition     = contains(["aws", "floci"], var.target)
+    error_message = "target must be \"aws\" or \"floci\"."
+  }
+}
+
 variable "simulator_enabled" {
   type    = bool
   default = true

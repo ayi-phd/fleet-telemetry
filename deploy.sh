@@ -21,6 +21,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA="$ROOT/terraform/infra"
 PLATFORM="$ROOT/terraform/platform"
 SERVICES=(telemetry-processor realtime-router dashboard-api rbac-authz vehicle-simulator)
+LAMBDA_SERVICES=(iot-kafka-bridge) # built with --target runtime-lambda; not a Kubernetes Deployment
 
 AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
 PROJECT="${PROJECT:-fleet-telemetry}"
@@ -114,12 +115,15 @@ build() { # <repo name> <dockerfile> <context> [build args...]
   rm -f "$ROOT/.build-$repo.log"
 }
 for svc in "${SERVICES[@]}"; do
-  build "$svc" "$ROOT/services/Dockerfile" "$ROOT" --build-arg "SERVICE=$svc"
+  build "$svc" "$ROOT/services/Dockerfile" "$ROOT" --target runtime-standard --build-arg "SERVICE=$svc"
+done
+for svc in "${LAMBDA_SERVICES[@]}"; do
+  build "$svc" "$ROOT/services/Dockerfile" "$ROOT" --target runtime-lambda --build-arg "SERVICE=$svc"
 done
 build web "$ROOT/web/Dockerfile" "$ROOT/web"
 
 # Make sure the tag we pushed is what ECR actually has, before Kubernetes tries to pull it.
-for repo in "${SERVICES[@]}" web; do
+for repo in "${SERVICES[@]}" "${LAMBDA_SERVICES[@]}" web; do
   aws ecr describe-images --repository-name "$PROJECT/$repo" --image-ids "imageTag=$IMAGE_TAG" >/dev/null \
     || die "Image $PROJECT/$repo:$IMAGE_TAG is missing from ECR after push."
 done
@@ -172,7 +176,7 @@ $(printf '\033[1;32m')Fleet telemetry platform is running.$(printf '\033[0m')
   only receives the vehicles their permissions allow.
 
   OpenSearch Dashboards  $(tf "$INFRA" output -raw opensearch_dashboards_url)  (VPC-only)
-  IoT rule errors        aws logs tail $(tf "$INFRA" output -raw iot_rule_error_log_group) --follow
+  IoT rule errors        aws logs tail $(tf "$PLATFORM" output -raw iot_rule_error_log_group) --follow
   Service logs           kubectl -n $NAMESPACE logs -l app=telemetry-processor -f
 
   This stack costs money every hour it runs. Remove everything with ./destroy.sh

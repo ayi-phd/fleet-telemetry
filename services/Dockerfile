@@ -23,7 +23,15 @@ RUN protoc -I ../proto \
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     go mod download && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# Long-running Kubernetes services: --target runtime-standard
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime-standard
 COPY --from=build /out/app /app
 USER nonroot:nonroot
 ENTRYPOINT ["/app"]
+
+# iot-kafka-bridge, invoked by AWS IoT Core (or Floci's emulator): --target runtime-lambda.
+# The base image's WORKDIR is /var/task; aws-lambda-go talks to the Lambda Runtime API
+# itself, so no separate runtime interface client is needed.
+FROM public.ecr.aws/lambda/provided:al2023 AS runtime-lambda
+COPY --from=build /out/app ./app
+ENTRYPOINT ["./app"]

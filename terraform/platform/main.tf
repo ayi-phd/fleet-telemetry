@@ -1,6 +1,8 @@
 locals {
-  ns    = local.infra.kubernetes_namespace
-  image = { for k, url in local.infra.ecr_repository_urls : k => "${url}:${var.image_tag}" }
+  ns      = local.infra.kubernetes_namespace
+  project = local.infra.cluster_name # account/region-scoped name, e.g. for IAM and Lambda
+  floci   = var.target == "floci"
+  image   = { for k, url in local.infra.ecr_repository_urls : k => "${url}:${var.image_tag}" }
 }
 
 resource "kubernetes_namespace_v1" "fleet" {

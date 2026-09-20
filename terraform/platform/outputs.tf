@@ -23,3 +23,7 @@ output "demo_password" {
 output "simulated_vins" {
   value = local.sim_vins
 }
+
+output "iot_rule_error_log_group" {
+  value = aws_cloudwatch_log_group.iot_rule_errors.name
+}

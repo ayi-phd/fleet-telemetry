@@ -66,10 +66,6 @@ output "iot_vehicle_policy_name" {
   value = aws_iot_policy.vehicle.name
 }
 
-output "iot_rule_error_log_group" {
-  value = aws_cloudwatch_log_group.iot_rule_errors.name
-}
-
 output "dashboard_allowed_cidrs" {
   description = "Client allow-list, applied again as loadBalancerSourceRanges on the web Service."
   value       = var.dashboard_allowed_cidrs
@@ -78,4 +74,9 @@ output "dashboard_allowed_cidrs" {
 output "vpc_id" {
   description = "Used by destroy.sh to clean up load balancers and ENIs that AWS creates outside Terraform."
   value       = module.vpc.vpc_id
+}
+
+output "private_subnet_ids" {
+  description = "Used by the platform stack's iot-kafka-bridge Lambda VPC config."
+  value       = module.vpc.private_subnets
 }
