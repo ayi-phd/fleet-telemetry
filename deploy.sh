@@ -79,12 +79,29 @@ if [[ "$TARGET" == "floci" ]]; then
   step "Checking Floci"
   FLOCI_ENDPOINT="${FLOCI_ENDPOINT:-http://localhost:4566}"
   FLOCI_IOT_ENDPOINT="${FLOCI_IOT_ENDPOINT:-floci}"
+  FLOCI_CONTAINER="${FLOCI_CONTAINER:-floci}"
+  floci_setup_help="This script expects Floci already running and configured; it does not start it.
+The floci CLI (floci start) can't turn on its MQTT broker or publish the ports it needs, so
+start the container directly instead:
+  docker run -d --name floci \\
+    -v /var/run/docker.sock:/var/run/docker.sock \\
+    -v floci-data:/app/data \\
+    -p 4566:4566 -p 1883:1883 -p 8883:8883 \\
+    -e FLOCI_SERVICES_IOT_MQTT_AUTO_START=true \\
+    floci/floci:latest /app/application -Dquarkus.http.host=0.0.0.0
+Set FLOCI_ENDPOINT if Floci isn't at http://localhost:4566, or FLOCI_CONTAINER if it's not
+named 'floci'."
   curl -fsS --max-time 5 "$FLOCI_ENDPOINT/_floci/health" >/dev/null 2>&1 || die "Floci isn't reachable at $FLOCI_ENDPOINT.
-This script expects Floci already running and configured; it does not start it.
-  floci start --services iot,lambda,eks,kafka,elasticache,rds,opensearch,ecr,iam,sts
-Also required: k3s and Floci sharing a Docker network, FLOCI_TLS_ENABLED=true, and
-FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS set to a hostname pods can resolve (default here: floci).
-Set FLOCI_ENDPOINT if Floci isn't at http://localhost:4566."
+$floci_setup_help"
+  # Floci exposes no API to report whether its MQTT broker is on: vehicle-simulator's
+  # connections would otherwise retry forever without ever surfacing an error (confirmed on
+  # a live run - PLAN.md Phase 4). Check the container directly instead.
+  floci_env="$(docker inspect "$FLOCI_CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)"
+  floci_ports="$(docker inspect "$FLOCI_CONTAINER" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null)"
+  echo "$floci_env" | grep -qx 'FLOCI_SERVICES_IOT_MQTT_AUTO_START=true' \
+    && echo "$floci_ports" | grep -q '"1883/tcp"' && echo "$floci_ports" | grep -q '"8883/tcp"' \
+    || die "Floci is running but not configured for MQTT (needs FLOCI_SERVICES_IOT_MQTT_AUTO_START=true and ports 1883+8883 published).
+$floci_setup_help"
   export AWS_ENDPOINT_URL="$FLOCI_ENDPOINT"
   AWS_REGION="${AWS_REGION:-us-east-1}"
   export AWS_DEFAULT_REGION="$AWS_REGION"
@@ -225,16 +242,27 @@ if [[ "$TARGET" == "floci" ]]; then
   # so this runs, and re-patches both places below, on every deploy.
   node_container="floci-eks-$PROJECT"
   floci_hosts="" # newline-separated "ip name" pairs, no indentation (added by consumers)
+  add_floci_host() {
+    local cname="$1" hostname="$2"
+    local ip
+    ip="$(docker inspect "$cname" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)"
+    [[ -z "$ip" ]] && return
+    if [[ -z "$floci_hosts" ]]; then
+      floci_hosts="$ip $hostname"
+    else
+      floci_hosts="$(printf '%s\n%s' "$floci_hosts" "$ip $hostname")"
+    fi
+  }
   while read -r cname; do
     [[ "$cname" == "$node_container" ]] && continue
-    ip="$(docker inspect "$cname" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)"
-    [[ -z "$ip" ]] && continue
-    if [[ -z "$floci_hosts" ]]; then
-      floci_hosts="$ip $cname"
-    else
-      floci_hosts="$(printf '%s\n%s' "$floci_hosts" "$ip $cname")"
-    fi
+    add_floci_host "$cname" "$cname"
   done < <(docker ps --format '{{.Names}}' | grep '^floci-')
+  # The main Floci gateway container itself (plain "floci", not "floci-*") is where
+  # the vehicle-simulator's MQTT connection actually needs to land - confirmed on a
+  # live run that IOT_ENDPOINT ("floci" by default, from FLOCI_IOT_ENDPOINT) never
+  # resolved from a pod because the loop above only ever matched the "floci-*"
+  # prefix, so it was silently never patched (PLAN.md Phase 4).
+  add_floci_host "$FLOCI_CONTAINER" "$FLOCI_IOT_ENDPOINT"
 
   if docker inspect "$node_container" >/dev/null 2>&1; then
     while read -r ip cname; do

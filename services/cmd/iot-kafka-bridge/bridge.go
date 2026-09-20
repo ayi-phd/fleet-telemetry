@@ -63,6 +63,7 @@ func decodePayload(payload []byte) (raw []byte, vin string, err error) {
 func (h *bridgeHandler) Invoke(ctx context.Context, payload []byte) ([]byte, error) {
 	raw, vin, err := decodePayload(payload)
 	if err != nil {
+		h.log.Error("decode failed", "err", err, "payload_b64", base64.StdEncoding.EncodeToString(payload))
 		return nil, err
 	}
 

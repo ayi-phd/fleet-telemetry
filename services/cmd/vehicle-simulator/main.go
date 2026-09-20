@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -39,15 +40,24 @@ func main() {
 	dupRate := platform.EnvFloat("DUPLICATE_RATE", 0.03)
 	centerLat := platform.EnvFloat("CENTER_LAT", 37.7749)
 	centerLng := platform.EnvFloat("CENTER_LNG", -122.4194)
+	// IOT_TLS mirrors KAFKA_TLS/REDIS_TLS elsewhere: true on AWS (real IoT Core requires
+	// mutual TLS on 8883). false only on Floci, whose 8883 listener never completes a TLS
+	// handshake regardless of client certificate (confirmed directly against the raw
+	// socket - PLAN.md Phase 4), unlike its plaintext MQTT broker on 1883, which works.
+	tlsEnabled := platform.EnvBool("IOT_TLS", true)
 
 	// IOT_CA_FILE is the CA that signs the broker's TLS certificate: Amazon Root CA 1 on
-	// AWS, Floci's /_floci/ca.pem on Floci. Neither is in the system trust store, so
-	// without it the connection fails closed rather than silently trusting nothing extra.
-	caFile := platform.Env("IOT_CA_FILE", "")
-	caPool, err := loadCAPool(caFile)
-	if err != nil {
-		log.Error("load IoT CA file", "file", caFile, "err", err)
-		os.Exit(1)
+	// AWS. Not in the system trust store, so without it the connection fails closed
+	// rather than silently trusting nothing extra. Unused when IOT_TLS is false.
+	var caPool *x509.CertPool
+	if tlsEnabled {
+		caFile := platform.Env("IOT_CA_FILE", "")
+		var err error
+		caPool, err = loadCAPool(caFile)
+		if err != nil {
+			log.Error("load IoT CA file", "file", caFile, "err", err)
+			os.Exit(1)
+		}
 	}
 
 	vins, err := discoverVINs(certDir)
@@ -69,7 +79,7 @@ func main() {
 			case <-time.After(time.Duration(i) * 200 * time.Millisecond):
 			}
 			v := newVehicle(vin, centerLat, centerLng)
-			if err := v.run(ctx, endpoint, certDir, interval, dupRate, caPool); err != nil {
+			if err := v.run(ctx, endpoint, certDir, interval, dupRate, tlsEnabled, caPool); err != nil {
 				log.Error("vehicle stopped", "vin", vin, "err", err)
 			}
 		}(i, vin)
@@ -169,24 +179,29 @@ func (v *vehicle) step(dt time.Duration) {
 	v.soc = math.Max(0, math.Min(100, v.soc))
 }
 
-func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval time.Duration, dupRate float64, caPool *x509.CertPool) error {
-	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, v.vin+".cert.pem"), filepath.Join(certDir, v.vin+".key.pem"))
-	if err != nil {
-		return err
-	}
+func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval time.Duration, dupRate float64, tlsEnabled bool, caPool *x509.CertPool) error {
 	opts := mqtt.NewClientOptions().
-		AddBroker("tls://" + endpoint + ":8883").
 		SetClientID(v.vin).
-		SetTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: caPool, MinVersion: tls.VersionTLS12}).
 		SetKeepAlive(30 * time.Second).
 		SetCleanSession(true).
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(5 * time.Second)
+	if tlsEnabled {
+		cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, v.vin+".cert.pem"), filepath.Join(certDir, v.vin+".key.pem"))
+		if err != nil {
+			return err
+		}
+		opts.AddBroker("tls://" + endpoint + ":8883").
+			SetTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: caPool, MinVersion: tls.VersionTLS12})
+	} else {
+		opts.AddBroker("tcp://" + endpoint + ":1883")
+	}
 	client := mqtt.NewClient(opts)
 	if tok := client.Connect(); tok.Wait() && tok.Error() != nil {
 		return tok.Error()
 	}
+	slog.Info("connected to IoT broker", "vin", v.vin, "tls", tlsEnabled)
 	defer client.Disconnect(250)
 
 	t := time.NewTicker(interval)
@@ -212,9 +227,16 @@ func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval ti
 		if !client.IsConnectionOpen() {
 			continue
 		}
-		client.Publish(topic, 1, false, payload).WaitTimeout(5 * time.Second)
+		publish(v.vin, client, payload)
 		if v.rng.Float64() < dupRate { // exercise the deduplication path
-			client.Publish(topic, 1, false, payload).WaitTimeout(5 * time.Second)
+			publish(v.vin, client, payload)
 		}
+	}
+}
+
+func publish(vin string, client mqtt.Client, payload []byte) {
+	tok := client.Publish(topic, 1, false, payload)
+	if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+		slog.Warn("publish did not confirm", "vin", vin, "err", tok.Error())
 	}
 }
