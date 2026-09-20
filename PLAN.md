@@ -298,7 +298,7 @@ Resolve each open question; apply the fallback where the answer is no, and recor
 | Does the Terraform AWS provider honour `AWS_ENDPOINT_URL`? | **Yes.** Confirmed throughout every live run in this phase; no `endpoints {}` block needed. |
 | Does Floci return pod-resolvable hostnames for MSK/RDS/ElastiCache/OpenSearch, or does it return `localhost`? | **All four needed a fix, for two different reasons.** OpenSearch (container-name hostname) and MSK (a *different* container-name hostname than the seed address, advertised via Kafka's own metadata protocol - see below) are resolvable in principle, but **nothing on Floci's default Docker bridge network can resolve any container by name at all** (no embedded DNS there - confirmed directly: `nslookup` from inside the k3s node container returns `NXDOMAIN` for a container that demonstrably exists, while reaching the same container by IP works fine). ElastiCache separately returns the literal string `"localhost"` for `primary_endpoint_address`, which is simply wrong at any layer. RDS returns a plain IP and needed no fix. **Fix implemented for all of it**: `deploy.sh` now discovers every `floci-*` container by name at deploy time and patches the resulting IP/name pairs into both the k3s node's `/etc/hosts` (for containerd's image pulls, which resolve at the node level) and CoreDNS's `Corefile` as a `hosts {}` block (for pod-level application traffic, which resolves through cluster DNS) - see Phase 4.5. `redis_address` also got a Floci-specific hostname override in Terraform, matching the pattern already used for `opensearch_endpoint`. |
 | Does Floci's `aws_iam_openid_connect_provider` accept the static placeholder thumbprint, and does creating an OIDC provider succeed there at all? | **No.** Floci's EKS emulation never populates `aws_eks_cluster.identity` (permanently empty, confirmed after 30+ minutes of an ACTIVE cluster) — there is no OIDC issuer to create a provider against. IRSA is AWS-only; Floci uses a static Floci-local IAM user's access key instead (Option A, see Phase 3.5 below). |
-| Does IoT deliver the protobuf bytes to the Lambda with `SELECT *`? | Still not reached - blocked behind the vehicle-simulator TLS issue below (nothing publishes to `fleet/telemetry` yet to test the rule against). |
+| Does IoT deliver the protobuf bytes to the Lambda with `SELECT *`? | **No, on Floci - and no rule SQL variant fixes it.** Floci's IoT rules engine forces every MQTT payload through UTF-8 decoding before any rule SQL runs at all, silently replacing every non-UTF8 byte with U+FFFD - confirmed by inspecting the exact bytes the Lambda received (see Phase 4.5). `encode(*, 'base64') AS payload` doesn't help either, since the corruption happens upstream of SQL evaluation. Whether real AWS's rules engine has the same limitation for a plain binary (non-JSON) payload is still an open question for Phase 5 - it may not, since AWS's engine is a different implementation entirely. |
 | Do plain EKS cluster, IAM roles and `access_config` succeed on Floci? | **Cluster creation succeeds** (reaches `ACTIVE`), with two caveats, both confirmed on live runs and both accepted rather than engineered around (Phase 4.5 below): a transient `FAILED` status during creation that self-resolves, and `access_config` never being echoed back on refresh (forces replacement on every subsequent apply). |
 | Does Docker push to the registry host `ecr_registry` now outputs for Floci? | **Yes, once our own bug was fixed** (see Phase 4.5: the doubled-project-name path). With the correct path, push, the k3s node's containerd pull, and `deploy.sh`'s own verification all work reliably. |
 | Does Floci's IoT support the CloudWatch error action (already assumed no and gated off)? | Not yet tested; still gated off. |
@@ -384,34 +384,136 @@ Resolve each open question; apply the fallback where the answer is no, and recor
     metadata protocol, and clients reconnect to *that* for actual produce/consume. The
     dynamic `floci-*` discovery above happens to cover this for free, since it patches
     in whatever MSK container actually exists by name, not a hardcoded one.
-- [ ] **Still blocking, and not fixable in this repository**: Floci's IoT certificate
-      emulation is broken. `aws iot describe-certificate` returns
-      `"certificatePem": "-----BEGIN CERTIFICATE-----\n<the certificate's own hex ID>\n-----END CERTIFICATE-----"`
+- [x] **Floci's IoT certificate emulation is broken - resolved with a self-signed
+      keypair on Floci, real AWS-issued certs unchanged on AWS.** `aws iot
+      describe-certificate` returns `"certificatePem":
+      "-----BEGIN CERTIFICATE-----\n<the certificate's own hex ID>\n-----END CERTIFICATE-----"`
       - the certificate ID wrapped in PEM armor, not a real X.509 certificate - confirmed
-      directly against the raw API response, not a parsing issue on our end. Every
-      `vehicle-simulator` connection fails immediately with `x509: malformed certificate`
-      before any TLS handshake is attempted. There is no code change available in this
-      repository that fixes Floci's own certificate generation; a workaround (e.g.
-      generating simulator certificates ourselves instead of relying on
-      `aws_iot_certificate`, and updating the IoT policy/simulator TLS setup to match)
-      would be a real design change requiring the user's decision, not something to pick
-      unilaterally. Not yet decided.
+      directly against the raw API response. Registering an externally-generated
+      certificate doesn't work around it either: `RegisterCertificateWithoutCA` is
+      misrouted to Floci's S3 handler entirely (confirmed via the S3-style error body),
+      and `CreateCertificateFromCsr` hits the identical bogus-PEM bug. **Decision (given
+      by the user): generate the simulator's certificates ourselves.** `terraform/platform/simulator.tf`
+      now has Floci-only `tls_private_key`/`tls_self_signed_cert` resources (`hashicorp/tls`
+      provider) per VIN; `aws_iot_certificate`/`_thing_principal_attachment`/`_policy_attachment`
+      are skipped entirely on Floci (`for_each = local.floci ? toset([]) : ...`), since there
+      is no working way to register a certificate there and Floci's broker doesn't check
+      one anyway. AWS is untouched - it still issues and registers real certificates.
+- [x] **Floci's MQTT broker doesn't run at all unless explicitly told to.** By default
+      Floci exposes only port 4566 (the control-plane API) - no 1883, no 8883, and
+      `data.aws_iot_endpoint` returns `localhost:4566`, not a device-gateway address.
+      `floci services`/`floci status` still claim `iot`/`iotdata` are "running", but that
+      covers only the control-plane API and the `iot-data:Publish` HTTP injection call
+      (confirmed working via a direct `aws iot-data publish` test, which did invoke the
+      Lambda) - not a real broker a device can open a connection to. The fix,
+      **`FLOCI_SERVICES_IOT_MQTT_AUTO_START=true`** plus publishing ports 1883 and 8883,
+      turns on a genuine embedded Vert.x MQTT broker (confirmed: a raw MQTT CONNECT
+      packet sent straight over a socket to port 1883 gets back a real CONNACK). The
+      `floci` CLI (`floci start`) has **no flag, env-passthrough, or profile field** for
+      either setting - confirmed by inspecting `floci start --help`, every `floci config
+      profile` field, and that `floci start` does not forward `FLOCI_*`-prefixed vars
+      from the host shell into the container. The only way to set them is a raw `docker
+      run` bypassing the `floci` CLI entirely, which is now what the README documents
+      and what `deploy.sh`'s preflight check verifies directly via `docker inspect`
+      (failing with the exact command if either is missing) - it still never starts or
+      reconfigures Floci itself, per `CLAUDE.md`.
+- [x] **Floci's TLS/mTLS listener on 8883 doesn't work at all, with or without a client
+      certificate.** Confirmed directly: an OpenSSL handshake to `8883` with a real
+      generated client cert either resets the connection outright (over IPv6) or returns
+      a malformed TLS record that fails to decode (`decode error`, over IPv4) - the
+      server never completes a ServerHello. Plaintext MQTT on `1883` works correctly
+      (real CONNACK, real PUBLISH accepted). Since real AWS IoT Core has no plaintext
+      option (mutual TLS is mandatory there), `vehicle-simulator` got a new **`IOT_TLS`**
+      env var (mirroring `KAFKA_TLS`/`REDIS_TLS`): `true` on AWS (`tls://…:8883` with the
+      client cert), `false` on Floci (`tcp://…:1883`, no cert loaded at all). This is
+      confined to the one target-conditional env var and an `if tlsEnabled {…} else {…}`
+      branch in `vehicle-simulator`'s `run()` - the wire protocol AWS actually uses is
+      unchanged.
+- [x] **The bare `floci` gateway container was never patched into DNS.** The
+      `floci-*` container-discovery loop in `deploy.sh` (Phase 4.5 below) matches the
+      glob `floci-*` - which never matches the plain container named `floci` itself, the
+      one thing `IOT_ENDPOINT` (default `"floci"`) actually needs pods to resolve. Every
+      `vehicle-simulator` connection attempt failed silently (paho's `ConnectRetry`
+      swallows the error, so nothing gets logged) until this was found by directly
+      testing DNS/TCP reachability from a debug pod on the cluster network. Fixed:
+      `deploy.sh`'s discovery loop now also explicitly patches `$FLOCI_CONTAINER` under
+      the hostname `$FLOCI_IOT_ENDPOINT` (same mechanism, one extra call).
+- [x] **The actual root cause of the remaining silence: Floci's IoT rules engine
+      corrupts binary MQTT payloads irrecoverably, before any rule SQL runs.** Once MQTT
+      itself worked (broker on, DNS patched, plaintext fallback in place), all 12
+      simulated vehicles connected and every `Publish` call returned no error - yet
+      `raw-telemetry`'s high-watermark stayed at 0. The Lambda *was* being invoked
+      (confirmed via its CloudWatch log group growing), but every invocation failed to
+      decode the payload as protobuf. Diagnostic logging added to
+      `iot-kafka-bridge`'s `decodePayload` (a permanent, useful addition - logs the
+      base64 payload on any decode failure) revealed the actual bytes received: the
+      original protobuf with every non-UTF8 byte sequence replaced by `EF BF BD` (UTF-8
+      for U+FFFD, the Unicode replacement character). This is conclusive: **Floci forces
+      every MQTT payload through UTF-8 string decoding somewhere before rule SQL ever
+      evaluates it**, silently and irreversibly destroying arbitrary binary data -
+      confirmed to be untouched by which rule SQL variant is used (`SELECT *` and
+      `SELECT encode(*, 'base64') AS payload` both produced the identical corruption,
+      since the damage happens upstream of both).
 
-**Status at the end of this session**: on a from-scratch Floci deploy, Stage 1 (infra)
-and Stage 2 (image build/push) complete cleanly and repeatably. In Stage 3,
-**`rbac-authz`, `telemetry-processor`, `realtime-router`, `dashboard-api` and `web` all
-reach `1/1 Running`** - the full pipeline from Postgres/Redis/Kafka/OpenSearch through to
-the dashboard is up. Only `vehicle-simulator` is blocked, on the IoT certificate issue
-above, which also means the IoT→Lambda→MSK leg of the pipeline (the actual telemetry
-path) is unverified end-to-end pending that decision.
+      **Decision (given by the user): make the wire format itself UTF-8-safe on Floci,
+      goal being to keep as much of the pipeline identical to AWS as possible.**
+      `vehicle-simulator` got a new **`IOT_WIRE_JSON`** env var (Floci-only, `false` on
+      AWS): when true, it publishes `{"payload":"<base64 of the real protobuf bytes>"}`
+      as the MQTT payload instead of raw protobuf bytes - valid ASCII/JSON, so nothing
+      for Floci's engine to corrupt. `iot-kafka-bridge`'s `decodePayload` already
+      supported unwrapping exactly this envelope (it was originally written for a
+      different anticipated reason - some IoT rule SQL variants producing this shape on
+      real AWS) and forwards the original, unmodified protobuf bytes to Kafka - so
+      `telemetry-processor` and everything downstream sees byte-identical records on
+      both targets. The IoT rule SQL itself is back to plain `SELECT * FROM
+      'fleet/telemetry'` on both targets (the `encode(*, 'base64')` experiment was
+      reverted once proven ineffective).
+- [x] **A second, unrelated DNS gap: `iot-kafka-bridge`'s own Lambda execution
+      containers sit entirely outside the k3s cluster and its DNS patching.** Once the
+      wire-format fix got the Lambda decoding real protobuf, every produce to Kafka
+      still failed with `context deadline exceeded`. Cause: Floci runs each Lambda
+      invocation in its own `floci-<project>-iot-kafka-bridge-<hash>` container (a
+      stable pool - confirmed at exactly 20 containers, not unbounded growth), which
+      lives on the same DNS-less default bridge network as everything else, but is
+      never touched by `deploy.sh`'s node/CoreDNS patching (that only reaches the k3s
+      node and cluster DNS). `KAFKA_BROKERS` bootstraps fine via IP, but Kafka's
+      metadata protocol then hands the client MSK's actual (randomly-suffixed)
+      container-name hostname for the real produce request, which this container can't
+      resolve. Since these containers can't be pre-patched at deploy time (some are
+      created lazily, during live traffic, well after `deploy.sh` finishes), the fix
+      runs from inside the Lambda itself: a new **`FLOCI_EXTRA_HOSTS`** Terraform
+      variable and Lambda environment entry carries the exact same newline-separated
+      `floci_hosts` list `deploy.sh` already builds for the node/CoreDNS patch;
+      `iot-kafka-bridge`'s `main()` now calls `patchFlociHosts()` at cold start, which
+      appends any missing lines straight into its own `/etc/hosts` before the Kafka
+      client is created. Empty (a no-op) on AWS.
 
-- [ ] End to end on Floci: simulator → IoT → Lambda → MSK → dashboard, with permission filtering
-      working for two users. **Partially reached** — see status above; blocked on the
-      simulator TLS/certificate issue.
-- [ ] `TARGET=floci ./destroy.sh` removes everything. **Not yet verified** with the
-      current, much-more-complete platform stack (DNS patches, `null_resource`
-      OpenSearch, IRSA fallback) - worth a full destroy/recreate cycle once the
-      simulator question is resolved.
+**Status at the end of this session: the full pipeline works end to end on Floci,
+verified on a genuinely clean, from-scratch `TARGET=floci ./deploy.sh` run with no
+manual intervention.** All 6 services (`rbac-authz`, `telemetry-processor`,
+`realtime-router`, `dashboard-api`, `web`, `vehicle-simulator`) reach `1/1 Running`.
+`raw-telemetry` and `canonical-events` both accumulate real messages continuously
+(confirmed via `rpk topic describe -p`, growing over multiple checks), and OpenSearch's
+document count tracks `canonical-events`'s high-watermark exactly. Permission filtering
+verified live via `/api/vehicles/latest` with two different demo user sessions:
+`admin` sees all 12 simulated vehicles, `north-manager` sees 4 (their fleet only).
+
+- [x] End to end on Floci: simulator → IoT → Lambda → MSK → dashboard, with permission
+      filtering working for two users. **Fully verified**, see status above.
+- [x] `TARGET=floci ./destroy.sh` removes everything Terraform/deploy.sh created.
+      **Verified**, with one Floci-side cleanup bug found and fixed: `aws opensearch
+      delete-domain` and RDS's real `DeleteDBInstance` call both tell Floci's control
+      plane the resource is gone and Terraform reports a clean destroy, but the actual
+      Docker container either API spawned keeps running regardless - confirmed directly
+      (`floci-opensearch-fleet-telemetry` and `floci-rds-<suffix>` were both still
+      running after a "successful" destroy). Fixed for OpenSearch, where we already own
+      a custom destroy provisioner for exactly this kind of manual cleanup: it now also
+      runs `docker rm -f floci-opensearch-<name>`. **Not fixed for RDS** - there is no
+      equivalent custom resource to hook a cleanup command into without introducing new
+      teardown logic scoped well beyond this session's task; left as a known, minor
+      Floci-side leak (manual `docker rm` after a destroy, if it matters for local disk
+      space). Floci's own persistent containers (`floci`, `floci-ecr-registry`) correctly
+      survive `destroy.sh`, as designed.
 
 ## Phase 5: verify on real AWS — **gated, needs separate human approval**
 
@@ -420,8 +522,12 @@ Costs roughly $0.90/hour. Do not start without asking at that point.
 - [ ] `./deploy.sh`; confirm all pods ready and the dashboard reachable.
 - [ ] Simulator → IoT → Lambda → MSK → processor → router → dashboard works; the IoT rule error
       log and the Lambda's failure destination are empty.
-- [ ] Record whether IoT delivered raw bytes with `SELECT *` or the rule needs
-      `encode(*, 'base64')`; adjust the rule SQL if needed.
+- [ ] Record whether IoT delivered raw bytes with `SELECT *`, or whether it needs
+      `IOT_WIRE_JSON` too (Floci needed it - its rules engine corrupts binary payloads by
+      forcing UTF-8 decoding before any SQL runs, confirmed with byte-level evidence in
+      Phase 4.5; real AWS's rules engine is a different implementation and may not have
+      this limitation at all). If it does, flip `IOT_WIRE_JSON` on for AWS too rather
+      than inventing another mechanism, since `iot-kafka-bridge` already handles it.
 - [ ] Permission filtering: two users in separate browsers see only their vehicles.
 - [ ] 2.9 check: the node security group has the client-range rules.
 - [ ] Confirm the pinned EKS, MSK and OpenSearch versions are accepted.

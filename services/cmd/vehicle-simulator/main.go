@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -45,6 +47,17 @@ func main() {
 	// handshake regardless of client certificate (confirmed directly against the raw
 	// socket - PLAN.md Phase 4), unlike its plaintext MQTT broker on 1883, which works.
 	tlsEnabled := platform.EnvBool("IOT_TLS", true)
+	// IOT_WIRE_JSON: Floci only. Its IoT rules engine forces every MQTT payload through
+	// UTF-8 decoding before any rule SQL runs, silently replacing invalid byte sequences
+	// with U+FFFD - confirmed by inspecting the exact bytes the Lambda received, which
+	// were the original protobuf with every non-UTF8 byte corrupted this way. No rule SQL
+	// variant works around it, since the corruption happens before SQL evaluation (PLAN.md
+	// Phase 4). Publishing a UTF-8-safe JSON envelope instead of raw protobuf bytes avoids
+	// the corruption; iot-kafka-bridge already unwraps exactly this envelope
+	// (decodePayload's base64 "payload" field) and forwards the original, unmodified
+	// protobuf bytes to Kafka, so telemetry-processor sees identical records on both
+	// targets. AWS keeps the real wire format: protobuf bytes, no envelope.
+	wireJSON := platform.EnvBool("IOT_WIRE_JSON", false)
 
 	// IOT_CA_FILE is the CA that signs the broker's TLS certificate: Amazon Root CA 1 on
 	// AWS. Not in the system trust store, so without it the connection fails closed
@@ -79,7 +92,7 @@ func main() {
 			case <-time.After(time.Duration(i) * 200 * time.Millisecond):
 			}
 			v := newVehicle(vin, centerLat, centerLng)
-			if err := v.run(ctx, endpoint, certDir, interval, dupRate, tlsEnabled, caPool); err != nil {
+			if err := v.run(ctx, endpoint, certDir, interval, dupRate, tlsEnabled, wireJSON, caPool); err != nil {
 				log.Error("vehicle stopped", "vin", vin, "err", err)
 			}
 		}(i, vin)
@@ -179,7 +192,7 @@ func (v *vehicle) step(dt time.Duration) {
 	v.soc = math.Max(0, math.Min(100, v.soc))
 }
 
-func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval time.Duration, dupRate float64, tlsEnabled bool, caPool *x509.CertPool) error {
+func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval time.Duration, dupRate float64, tlsEnabled, wireJSON bool, caPool *x509.CertPool) error {
 	opts := mqtt.NewClientOptions().
 		SetClientID(v.vin).
 		SetKeepAlive(30 * time.Second).
@@ -224,6 +237,12 @@ func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval ti
 		if err != nil {
 			return err
 		}
+		if wireJSON {
+			payload, err = json.Marshal(wireEnvelope{Payload: base64.StdEncoding.EncodeToString(payload)})
+			if err != nil {
+				return err
+			}
+		}
 		if !client.IsConnectionOpen() {
 			continue
 		}
@@ -232,6 +251,12 @@ func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval ti
 			publish(v.vin, client, payload)
 		}
 	}
+}
+
+// wireEnvelope matches iot-kafka-bridge's decodePayload: a JSON object carrying the
+// original protobuf bytes, base64-encoded, under "payload".
+type wireEnvelope struct {
+	Payload string `json:"payload"`
 }
 
 func publish(vin string, client mqtt.Client, payload []byte) {
