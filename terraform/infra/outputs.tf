@@ -7,7 +7,7 @@ output "account_id" {
 }
 
 output "cluster_name" {
-  value = module.eks.cluster_name
+  value = aws_eks_cluster.this.name
 }
 
 output "kubernetes_namespace" {
@@ -36,7 +36,9 @@ output "msk_password" {
 }
 
 output "redis_address" {
-  value = "${aws_elasticache_replication_group.this.primary_endpoint_address}:6379"
+  # Floci fills only the configuration endpoint for cluster-mode-disabled replication
+  # groups (floci-io/floci #2618, #2769), leaving primary_endpoint_address empty.
+  value = "${coalesce(aws_elasticache_replication_group.this.primary_endpoint_address, aws_elasticache_replication_group.this.configuration_endpoint_address)}:6379"
 }
 
 output "redis_auth_token" {
@@ -79,4 +81,14 @@ output "vpc_id" {
 output "private_subnet_ids" {
   description = "Used by the platform stack's iot-kafka-bridge Lambda VPC config."
   value       = module.vpc.private_subnets
+}
+
+output "realtime_router_role_arn" {
+  description = "IRSA role for the realtime-router Kubernetes service account."
+  value       = aws_iam_role.realtime_router.arn
+}
+
+output "dashboard_api_role_arn" {
+  description = "IRSA role for the dashboard-api Kubernetes service account."
+  value       = aws_iam_role.dashboard_api.arn
 }

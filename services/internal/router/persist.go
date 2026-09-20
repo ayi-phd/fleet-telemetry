@@ -25,15 +25,16 @@ var indexedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // only after a successful bulk request (at-least-once); documents use eventId as
 // _id, which makes redelivery idempotent.
 type Persister struct {
-	OS          *platform.OpenSearch
-	IndexPrefix string
-	Log         *slog.Logger
+	OS            *platform.OpenSearch
+	IndexPrefix   string
+	IndexReplicas int // 0 on Floci's single-node domain, which can't allocate a replica shard
+	Log           *slog.Logger
 }
 
 const indexTemplate = `{
   "index_patterns": ["%s-*"],
   "template": {
-    "settings": {"number_of_shards": 1, "number_of_replicas": 1, "refresh_interval": "2s"},
+    "settings": {"number_of_shards": 1, "number_of_replicas": %d, "refresh_interval": "2s"},
     "mappings": {
       "dynamic": "strict",
       "properties": {
@@ -56,7 +57,7 @@ const indexTemplate = `{
 
 func (p *Persister) EnsureTemplate(ctx context.Context) error {
 	code, body, err := p.OS.Do(ctx, "PUT", "/_index_template/"+p.IndexPrefix,
-		[]byte(fmt.Sprintf(indexTemplate, p.IndexPrefix)), "")
+		[]byte(fmt.Sprintf(indexTemplate, p.IndexPrefix, p.IndexReplicas)), "")
 	if err != nil {
 		return err
 	}

@@ -7,8 +7,9 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  name = var.project
-  azs  = slice(data.aws_availability_zones.available.names, 0, 3)
+  name  = var.project
+  azs   = slice(data.aws_availability_zones.available.names, 0, 3)
+  floci = var.target == "floci"
 }
 
 module "vpc" {

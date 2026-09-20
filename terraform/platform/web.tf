@@ -16,7 +16,21 @@ resource "kubernetes_deployment_v1" "web" {
         labels = { app = "web" }
       }
       spec {
-        node_selector = { workload = "core" }
+        # Preferred, not required: Floci's single k3s node carries no "workload" label.
+        affinity {
+          node_affinity {
+            preferred_during_scheduling_ignored_during_execution {
+              weight = 50
+              preference {
+                match_expressions {
+                  key      = "workload"
+                  operator = "In"
+                  values   = ["core"]
+                }
+              }
+            }
+          }
+        }
         security_context {
           run_as_non_root = true
           run_as_user     = 101

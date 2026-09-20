@@ -33,7 +33,12 @@ func main() {
 		log.Error("opensearch client", "err", err)
 		os.Exit(1)
 	}
-	persister := &router.Persister{OS: osClient, IndexPrefix: platform.Env("INDEX_PREFIX", "telemetry"), Log: log}
+	persister := &router.Persister{
+		OS:            osClient,
+		IndexPrefix:   platform.Env("INDEX_PREFIX", "telemetry"),
+		IndexReplicas: platform.EnvInt("OPENSEARCH_INDEX_REPLICAS", 1),
+		Log:           log,
+	}
 	if err := platform.Retry(ctx, "opensearch index template", persister.EnsureTemplate); err != nil {
 		return
 	}

@@ -38,18 +38,24 @@ resource "kubernetes_secret_v1" "sim_certs" {
   data = merge(
     { for v in local.sim_vins : "${v}.cert.pem" => aws_iot_certificate.sim[v].certificate_pem },
     { for v in local.sim_vins : "${v}.key.pem" => aws_iot_certificate.sim[v].private_key },
+    # Amazon Root CA 1, so the simulator doesn't fall back to system roots (which don't
+    # include it). Floci-only: this is a placeholder until Phase 3's deploy.sh fetches
+    # Floci's own broker CA and swaps it in here - broker TLS verification stays broken
+    # on Floci until then.
+    { "ca.pem" = file("${path.module}/certs/amazon-root-ca-1.pem") },
   )
 }
 
 module "vehicle_simulator" {
-  count       = var.simulator_enabled ? 1 : 0
-  source      = "./modules/service"
-  name        = "vehicle-simulator"
-  namespace   = local.common.namespace
-  config_map  = local.common.config_map
-  secret_name = local.common.secret_name
-  image       = local.image["vehicle-simulator"]
-  replicas    = 1
+  count         = var.simulator_enabled ? 1 : 0
+  source        = "./modules/service"
+  name          = "vehicle-simulator"
+  namespace     = local.common.namespace
+  config_map    = local.common.config_map
+  secret_name   = local.common.secret_name
+  image         = local.image["vehicle-simulator"]
+  replicas      = 1
+  node_selector = { workload = "core" }
   secret_volume = {
     secret_name = kubernetes_secret_v1.sim_certs[0].metadata[0].name
     mount_path  = "/certs"
@@ -57,6 +63,7 @@ module "vehicle_simulator" {
   env = {
     IOT_ENDPOINT     = local.infra.iot_endpoint
     CERT_DIR         = "/certs"
+    IOT_CA_FILE      = "/certs/ca.pem"
     PUBLISH_INTERVAL = "2s"
     DUPLICATE_RATE   = "0.03"
     CENTER_LAT       = tostring(var.simulator_center.lat)
