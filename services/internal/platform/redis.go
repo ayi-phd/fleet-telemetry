@@ -24,7 +24,7 @@ func NewRedis() *redis.Client {
 }
 
 // Key conventions shared by rbac-authz (writer) and telemetry-processor (reader).
-func FleetKey(vin string) string          { return "fleet:vin:" + vin }
+func FleetKey(vin string) string           { return "fleet:vin:" + vin }
 func DedupKey(vin string, ts int64) string { return "dedup:" + vin + ":" + itoa(ts) }
 
 const FleetIndexKey = "fleet:vins"
