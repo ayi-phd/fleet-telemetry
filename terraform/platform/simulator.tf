@@ -97,9 +97,14 @@ module "vehicle_simulator" {
     mount_path  = "/certs"
   }
   env = {
-    IOT_ENDPOINT     = local.infra.iot_endpoint
-    CERT_DIR         = "/certs"
-    IOT_CA_FILE      = "/certs/ca.pem"
+    IOT_ENDPOINT = local.infra.iot_endpoint
+    CERT_DIR     = "/certs"
+    IOT_CA_FILE  = "/certs/ca.pem"
+    # Floci's 8883 listener never completes a TLS handshake, with or without a client
+    # certificate (confirmed directly against the raw socket - PLAN.md Phase 4); its
+    # plaintext MQTT broker on 1883 works. AWS keeps real mutual TLS - IoT Core has no
+    # plaintext option.
+    IOT_TLS          = tostring(!local.floci)
     PUBLISH_INTERVAL = "2s"
     DUPLICATE_RATE   = "0.03"
     CENTER_LAT       = tostring(var.simulator_center.lat)

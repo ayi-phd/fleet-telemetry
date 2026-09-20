@@ -242,16 +242,27 @@ if [[ "$TARGET" == "floci" ]]; then
   # so this runs, and re-patches both places below, on every deploy.
   node_container="floci-eks-$PROJECT"
   floci_hosts="" # newline-separated "ip name" pairs, no indentation (added by consumers)
+  add_floci_host() {
+    local cname="$1" hostname="$2"
+    local ip
+    ip="$(docker inspect "$cname" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)"
+    [[ -z "$ip" ]] && return
+    if [[ -z "$floci_hosts" ]]; then
+      floci_hosts="$ip $hostname"
+    else
+      floci_hosts="$(printf '%s\n%s' "$floci_hosts" "$ip $hostname")"
+    fi
+  }
   while read -r cname; do
     [[ "$cname" == "$node_container" ]] && continue
-    ip="$(docker inspect "$cname" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)"
-    [[ -z "$ip" ]] && continue
-    if [[ -z "$floci_hosts" ]]; then
-      floci_hosts="$ip $cname"
-    else
-      floci_hosts="$(printf '%s\n%s' "$floci_hosts" "$ip $cname")"
-    fi
+    add_floci_host "$cname" "$cname"
   done < <(docker ps --format '{{.Names}}' | grep '^floci-')
+  # The main Floci gateway container itself (plain "floci", not "floci-*") is where
+  # the vehicle-simulator's MQTT connection actually needs to land - confirmed on a
+  # live run that IOT_ENDPOINT ("floci" by default, from FLOCI_IOT_ENDPOINT) never
+  # resolved from a pod because the loop above only ever matched the "floci-*"
+  # prefix, so it was silently never patched (PLAN.md Phase 4).
+  add_floci_host "$FLOCI_CONTAINER" "$FLOCI_IOT_ENDPOINT"
 
   if docker inspect "$node_container" >/dev/null 2>&1; then
     while read -r ip cname; do
