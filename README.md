@@ -198,13 +198,30 @@ it expects one already running and configured, and tells you exactly what's miss
 TARGET=floci ./deploy.sh
 ```
 
-Required before running it:
+Required before running it: Floci itself, started with its real MQTT broker turned on and
+reachable from pods. The `floci` CLI (`floci start`) has no flag or profile field for either of
+those, so start the container directly instead:
+
+```bash
+docker run -d --name floci \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v floci-data:/app/data \
+  -p 4566:4566 -p 1883:1883 -p 8883:8883 \
+  -e FLOCI_SERVICES_IOT_MQTT_AUTO_START=true \
+  floci/floci:latest /app/application -Dquarkus.http.host=0.0.0.0
+```
+
+Without `FLOCI_SERVICES_IOT_MQTT_AUTO_START=true`, Floci's MQTT broker never starts: it
+listens on nothing, `vehicle-simulator`'s connections retry forever without ever surfacing an
+error (confirmed on a live run — PLAN.md Phase 4), and no telemetry ever reaches Kafka. Without
+the `-p 1883:1883 -p 8883:8883` mappings the broker has no port to listen on even once started.
+`deploy.sh` checks both (via `docker inspect floci`, since Floci exposes no API for this) and
+fails with this exact command if either is missing — it never starts or reconfigures Floci
+itself.
+
+Also required:
 
 - Floci reachable (default `http://localhost:4566`; override with `FLOCI_ENDPOINT`).
-- k3s and Floci sharing a Docker network, and `FLOCI_TLS_ENABLED=true` (IoT publishes over
-  TLS on 8883).
-- `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS` set to a hostname pods can resolve — the Floci
-  container name works; `deploy.sh` assumes `floci` unless `FLOCI_IOT_ENDPOINT` says otherwise.
 - Docker Desktop with roughly 12 GB of memory available.
 
 What's different on Floci, all switched by the same `target` Terraform variable: one broker
