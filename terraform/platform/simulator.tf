@@ -104,7 +104,13 @@ module "vehicle_simulator" {
     # certificate (confirmed directly against the raw socket - PLAN.md Phase 4); its
     # plaintext MQTT broker on 1883 works. AWS keeps real mutual TLS - IoT Core has no
     # plaintext option.
-    IOT_TLS          = tostring(!local.floci)
+    IOT_TLS = tostring(!local.floci)
+    # Floci's IoT rules engine forces every MQTT payload through UTF-8 decoding before
+    # any rule SQL runs, corrupting protobuf's binary bytes beyond recovery (confirmed
+    # by inspecting the exact bytes the Lambda received - PLAN.md Phase 4). Publishing
+    # a base64-JSON envelope instead avoids the corruption; iot-kafka-bridge already
+    # unwraps it and forwards the original, unmodified protobuf bytes to Kafka.
+    IOT_WIRE_JSON    = tostring(local.floci)
     PUBLISH_INTERVAL = "2s"
     DUPLICATE_RATE   = "0.03"
     CENTER_LAT       = tostring(var.simulator_center.lat)

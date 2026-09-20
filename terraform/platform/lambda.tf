@@ -85,12 +85,13 @@ resource "aws_lambda_function" "iot_kafka_bridge" {
 
   environment {
     variables = {
-      RAW_TOPIC      = "raw-telemetry"
-      KAFKA_BROKERS  = local.infra.msk_bootstrap_brokers
-      KAFKA_USERNAME = local.infra.msk_username
-      KAFKA_PASSWORD = local.infra.msk_password
-      KAFKA_TLS      = local.floci ? "false" : "true"
-      LOG_LEVEL      = "info"
+      RAW_TOPIC         = "raw-telemetry"
+      KAFKA_BROKERS     = local.infra.msk_bootstrap_brokers
+      KAFKA_USERNAME    = local.infra.msk_username
+      KAFKA_PASSWORD    = local.infra.msk_password
+      KAFKA_TLS         = local.floci ? "false" : "true"
+      LOG_LEVEL         = "info"
+      FLOCI_EXTRA_HOSTS = var.floci_extra_hosts
     }
   }
 }

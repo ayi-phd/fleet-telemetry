@@ -318,9 +318,16 @@ if [[ "$TARGET" == "floci" ]]; then
   # Floci's EKS emulation has no OIDC identity, so IRSA can't work there; realtime-router
   # and dashboard-api use this IAM user's key as static OpenSearch credentials instead
   # (see terraform/infra/iam_pods.tf and terraform/platform/main.tf).
+  # floci_hosts (built above) also goes to iot-kafka-bridge as an env var, so it can
+  # patch its own /etc/hosts at startup: its execution containers sit outside the k3s
+  # cluster, so the node/CoreDNS patching above never reaches them, yet Kafka's protocol
+  # advertises MSK's randomly-suffixed container name in its metadata responses, so even
+  # an IP bootstrap address isn't enough for the produce request that follows (confirmed
+  # on a live run - PLAN.md Phase 4).
   floci_creds_json=",
   \"floci_deploy_access_key_id\": \"$floci_key_id\",
-  \"floci_deploy_secret_access_key\": \"$floci_secret\""
+  \"floci_deploy_secret_access_key\": \"$floci_secret\",
+  \"floci_extra_hosts\": \"${floci_hosts//$'\n'/\\n}\""
 fi
 
 cat > "$PLATFORM/deploy.auto.tfvars.json" <<EOF

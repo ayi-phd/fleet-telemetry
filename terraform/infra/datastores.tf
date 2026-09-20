@@ -185,7 +185,13 @@ resource "null_resource" "opensearch_floci" {
   }
 
   provisioner "local-exec" {
-    when    = destroy
-    command = "aws opensearch delete-domain --domain-name '${self.triggers.domain_name}' >/dev/null 2>&1 || true"
+    when = destroy
+    # delete-domain only tells Floci's control plane the domain is gone; the container
+    # it spawned keeps running regardless (confirmed on a live destroy - PLAN.md Phase
+    # 4) - remove it directly too, same as this resource's own create step does.
+    command = <<-EOT
+      aws opensearch delete-domain --domain-name '${self.triggers.domain_name}' >/dev/null 2>&1 || true
+      docker rm -f 'floci-opensearch-${self.triggers.domain_name}' >/dev/null 2>&1 || true
+    EOT
   }
 }
