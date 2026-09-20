@@ -1,18 +1,7 @@
-resource "aws_msk_configuration" "this" {
-  name           = "${local.name}-config"
-  kafka_versions = [var.msk_kafka_version]
-
-  server_properties = <<-PROPS
-    auto.create.topics.enable=true
-    default.replication.factor=3
-    min.insync.replicas=2
-    num.partitions=6
-    log.retention.hours=72
-  PROPS
-
-  lifecycle { create_before_destroy = true }
-}
-
+# No custom MSK configuration: topics are created with explicit partitions, retention
+# and min.insync.replicas by platform.EnsureTopics (see internal/platform/kafka.go),
+# so nothing depends on broker-wide defaults or topic auto-creation. Floci's MSK
+# emulation is unlikely to implement the configuration API at all.
 resource "aws_msk_cluster" "this" {
   cluster_name           = local.name
   kafka_version          = var.msk_kafka_version
@@ -27,11 +16,6 @@ resource "aws_msk_cluster" "this" {
         volume_size = 100
       }
     }
-  }
-
-  configuration_info {
-    arn      = aws_msk_configuration.this.arn
-    revision = aws_msk_configuration.this.latest_revision
   }
 
   encryption_info {

@@ -104,11 +104,13 @@ fi
 info "Tag $IMAGE_TAG -> $REGISTRY"
 aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
 
-# EKS node groups are x86_64. The Dockerfiles cross-compile, so this is fast on arm64 hosts too.
+# EKS node groups and the Lambda are arm64 (Graviton; also what Floci's k3s and Lambda
+# containers run on Apple Silicon). The Dockerfiles cross-compile, so this is just as
+# fast from an amd64 builder.
 build() { # <repo name> <dockerfile> <context> [build args...]
   local repo="$1" file="$2" context="$3"; shift 3
   info "Building $repo"
-  docker buildx build --platform linux/amd64 --provenance=false --push \
+  docker buildx build --platform linux/arm64 --provenance=false --push \
     -f "$file" -t "$REGISTRY/$PROJECT/$repo:$IMAGE_TAG" "$@" "$context" \
     >"$ROOT/.build-$repo.log" 2>&1 \
     || { tail -n 40 "$ROOT/.build-$repo.log" >&2; die "Image build for $repo failed (full log: .build-$repo.log)."; }

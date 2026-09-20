@@ -54,7 +54,10 @@ resource "kubernetes_config_map_v1" "platform" {
     CANONICAL_TOPIC     = "canonical-events"
     DLQ_TOPIC           = "raw-telemetry-dlq"
     INDEX_PREFIX        = "telemetry"
-    LOG_LEVEL           = "info"
+    # 0 on Floci: its single-node OpenSearch domain can't allocate a replica shard,
+    # which would otherwise leave every index permanently yellow.
+    OPENSEARCH_INDEX_REPLICAS = local.floci ? "0" : "1"
+    LOG_LEVEL                 = "info"
   }
 }
 
@@ -69,15 +72,16 @@ locals {
 
 # ---------------- rbac-authz: users, grants, vehicle->fleet master data ----------------
 module "rbac_authz" {
-  source      = "./modules/service"
-  name        = "rbac-authz"
-  namespace   = local.common.namespace
-  config_map  = local.common.config_map
-  secret_name = local.common.secret_name
-  image       = local.image["rbac-authz"]
-  replicas    = var.replicas.rbac_authz
-  ports       = { http = 8080, grpc = 9090 }
-  secret_env  = ["POSTGRES_DSN", "REDIS_PASSWORD", "JWT_SIGNING_KEY", "DEMO_PASSWORD"]
+  source        = "./modules/service"
+  name          = "rbac-authz"
+  namespace     = local.common.namespace
+  config_map    = local.common.config_map
+  secret_name   = local.common.secret_name
+  image         = local.image["rbac-authz"]
+  replicas      = var.replicas.rbac_authz
+  ports         = { http = 8080, grpc = 9090 }
+  node_selector = { workload = "core" }
+  secret_env    = ["POSTGRES_DSN", "REDIS_PASSWORD", "JWT_SIGNING_KEY", "DEMO_PASSWORD"]
   env = {
     SEED_DEMO_DATA     = "true"
     DEMO_VEHICLE_COUNT = tostring(var.simulated_vehicle_count)
@@ -86,19 +90,22 @@ module "rbac_authz" {
 
 # ---------------- telemetry-processor: raw-telemetry -> canonical-events ----------------
 module "telemetry_processor" {
-  source      = "./modules/service"
-  name        = "telemetry-processor"
-  namespace   = local.common.namespace
-  config_map  = local.common.config_map
-  secret_name = local.common.secret_name
-  image       = local.image["telemetry-processor"]
-  replicas    = var.replicas.telemetry_processor
-  secret_env  = concat(local.kafka_secrets, ["REDIS_PASSWORD"])
+  source        = "./modules/service"
+  name          = "telemetry-processor"
+  namespace     = local.common.namespace
+  config_map    = local.common.config_map
+  secret_name   = local.common.secret_name
+  image         = local.image["telemetry-processor"]
+  replicas      = var.replicas.telemetry_processor
+  node_selector = { workload = "core" }
+  secret_env    = concat(local.kafka_secrets, ["REDIS_PASSWORD"])
   env = {
-    CONSUMER_GROUP    = "telemetry-processor"
-    DEDUP_TTL         = "1h"
-    TOPIC_PARTITIONS  = "6"
-    TOPIC_REPLICATION = "3"
+    CONSUMER_GROUP            = "telemetry-processor"
+    DEDUP_TTL                 = "1h"
+    TOPIC_PARTITIONS          = "6"
+    TOPIC_REPLICATION         = "3"
+    TOPIC_RETENTION           = "72h"
+    TOPIC_MIN_INSYNC_REPLICAS = "2"
   }
   # Fleet lookups need rbac-authz's initial Redis sync.
   depends_on = [module.rbac_authz]
@@ -116,8 +123,12 @@ module "realtime_router" {
   image                  = local.image["realtime-router"]
   replicas               = var.replicas.realtime_router
   ports                  = { grpc = 9090 }
-  create_service_account = true # bound to the OpenSearch IAM role via Pod Identity
-  secret_env             = local.kafka_secrets
+  node_selector          = { workload = "core" }
+  create_service_account = true # bound to the OpenSearch IAM role via IRSA
+  service_account_annotations = {
+    "eks.amazonaws.com/role-arn" = local.infra.realtime_router_role_arn
+  }
+  secret_env = local.kafka_secrets
   env = {
     PUSH_GROUP    = "realtime-router-push"
     PERSIST_GROUP = "realtime-router-persist"
@@ -136,10 +147,13 @@ module "dashboard_api" {
   image                  = local.image["dashboard-api"]
   replicas               = var.replicas.dashboard_api
   ports                  = { http = 8080 }
-  create_service_account = true
-  secret_env             = ["JWT_SIGNING_KEY"]
-  node_selector          = { workload = "edge" }
-  tolerations            = [{ key = "dedicated", value = "edge", effect = "NoSchedule" }]
+  create_service_account = true # bound to the OpenSearch IAM role via IRSA
+  service_account_annotations = {
+    "eks.amazonaws.com/role-arn" = local.infra.dashboard_api_role_arn
+  }
+  secret_env    = ["JWT_SIGNING_KEY"]
+  node_selector = { workload = "edge" }
+  tolerations   = [{ key = "dedicated", value = "edge", effect = "NoSchedule" }]
   env = {
     AUTHZ_ADDR           = "dns:///rbac-authz.${local.ns}.svc.cluster.local:9090"
     ROUTER_HEADLESS_HOST = "realtime-router-headless.${local.ns}.svc.cluster.local"

@@ -2,11 +2,12 @@
 # Build context: repository root. Usage:
 #   docker buildx build -f services/Dockerfile --build-arg SERVICE=telemetry-processor .
 # The build stage runs on the builder's native platform and cross-compiles, so an
-# arm64 laptop produces amd64 images for the EKS nodes without QEMU emulation.
+# amd64 builder still produces arm64 images (for the Graviton EKS nodes and the
+# Lambda) without QEMU emulation.
 FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 ARG SERVICE
 ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETARCH=arm64
 ENV GOTOOLCHAIN=auto CGO_ENABLED=0
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
  && rm -rf /var/lib/apt/lists/*

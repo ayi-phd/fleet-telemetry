@@ -6,6 +6,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -38,6 +40,16 @@ func main() {
 	centerLat := platform.EnvFloat("CENTER_LAT", 37.7749)
 	centerLng := platform.EnvFloat("CENTER_LNG", -122.4194)
 
+	// IOT_CA_FILE is the CA that signs the broker's TLS certificate: Amazon Root CA 1 on
+	// AWS, Floci's /_floci/ca.pem on Floci. Neither is in the system trust store, so
+	// without it the connection fails closed rather than silently trusting nothing extra.
+	caFile := platform.Env("IOT_CA_FILE", "")
+	caPool, err := loadCAPool(caFile)
+	if err != nil {
+		log.Error("load IoT CA file", "file", caFile, "err", err)
+		os.Exit(1)
+	}
+
 	vins, err := discoverVINs(certDir)
 	if err != nil || len(vins) == 0 {
 		log.Error("no vehicle certificates found", "dir", certDir, "err", err)
@@ -57,7 +69,7 @@ func main() {
 			case <-time.After(time.Duration(i) * 200 * time.Millisecond):
 			}
 			v := newVehicle(vin, centerLat, centerLng)
-			if err := v.run(ctx, endpoint, certDir, interval, dupRate); err != nil {
+			if err := v.run(ctx, endpoint, certDir, interval, dupRate, caPool); err != nil {
 				log.Error("vehicle stopped", "vin", vin, "err", err)
 			}
 		}(i, vin)
@@ -77,6 +89,24 @@ func discoverVINs(dir string) ([]string, error) {
 	}
 	sort.Strings(vins)
 	return vins, nil
+}
+
+// loadCAPool reads a PEM CA bundle for trusting the IoT broker's TLS certificate.
+// An empty path falls back to nil, meaning "trust the system's root store" - today's
+// behavior, kept for anyone running the simulator without IOT_CA_FILE configured.
+func loadCAPool(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, nil
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("no certificates found in %s", path)
+	}
+	return pool, nil
 }
 
 type vehicle struct {
@@ -139,7 +169,7 @@ func (v *vehicle) step(dt time.Duration) {
 	v.soc = math.Max(0, math.Min(100, v.soc))
 }
 
-func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval time.Duration, dupRate float64) error {
+func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval time.Duration, dupRate float64, caPool *x509.CertPool) error {
 	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, v.vin+".cert.pem"), filepath.Join(certDir, v.vin+".key.pem"))
 	if err != nil {
 		return err
@@ -147,7 +177,7 @@ func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval ti
 	opts := mqtt.NewClientOptions().
 		AddBroker("tls://" + endpoint + ":8883").
 		SetClientID(v.vin).
-		SetTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}).
+		SetTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: caPool, MinVersion: tls.VersionTLS12}).
 		SetKeepAlive(30 * time.Second).
 		SetCleanSession(true).
 		SetAutoReconnect(true).

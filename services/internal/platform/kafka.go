@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -44,10 +46,20 @@ func (c KafkaConfig) Opts() []kgo.Opt {
 	return opts
 }
 
-// EnsureTopics creates topics if they do not exist. Existing topics are left untouched.
-func EnsureTopics(ctx context.Context, cl *kgo.Client, partitions int32, replication int16, topics ...string) error {
+// EnsureTopics creates topics if they do not exist, with explicit retention and
+// min.insync.replicas set per topic rather than relying on broker-wide defaults or
+// topic auto-creation (there is no custom MSK configuration; see terraform/infra/msk.tf).
+// Existing topics are left untouched.
+func EnsureTopics(ctx context.Context, cl *kgo.Client, partitions int32, replication int16, retention time.Duration, minInsyncReplicas int, topics ...string) error {
+	retentionMs := strconv.FormatInt(retention.Milliseconds(), 10)
+	minISR := strconv.Itoa(minInsyncReplicas)
+	configs := map[string]*string{
+		"retention.ms":        &retentionMs,
+		"min.insync.replicas": &minISR,
+	}
+
 	adm := kadm.NewClient(cl)
-	resp, err := adm.CreateTopics(ctx, partitions, replication, nil, topics...)
+	resp, err := adm.CreateTopics(ctx, partitions, replication, configs, topics...)
 	if err != nil {
 		return err
 	}

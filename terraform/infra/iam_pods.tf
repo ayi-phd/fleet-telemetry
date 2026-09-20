@@ -1,24 +1,49 @@
-# EKS Pod Identity: pods get AWS credentials through their Kubernetes service account.
-# Only the services that call OpenSearch need AWS permissions; everything else uses
-# credentials injected as Kubernetes secrets by the platform stack.
+# IRSA: pods get AWS credentials by assuming a role via their Kubernetes service
+# account's OIDC-federated identity. Only the services that call OpenSearch need AWS
+# permissions; everything else uses credentials injected as Kubernetes secrets by
+# the platform stack.
+#
+# The certificate-fetch step the terraform-aws-modules/eks module normally does to
+# compute this thumbprint isn't served by Floci, and AWS no longer validates the
+# thumbprint against the issuer's actual chain for OIDC providers backed by a
+# publicly trusted CA (which EKS's always is) - so a static, well-known placeholder
+# is used on both targets instead of fetching one.
+resource "aws_iam_openid_connect_provider" "eks" {
+  url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["9e99a48a9960b14926bb7f3b02e22da2b0ab7280"]
+}
 
-data "aws_iam_policy_document" "pod_identity_trust" {
+locals {
+  opensearch_arn        = "arn:${data.aws_partition.current.partition}:es:${var.region}:${data.aws_caller_identity.current.account_id}:domain/${local.name}"
+  oidc_issuer_host_path = replace(aws_iam_openid_connect_provider.eks.url, "https://", "")
+}
+
+data "aws_iam_policy_document" "irsa_trust" {
+  for_each = toset(["realtime-router", "dashboard-api"])
+
   statement {
-    actions = ["sts:AssumeRole", "sts:TagSession"]
+    actions = ["sts:AssumeRoleWithWebIdentity"]
     principals {
-      type        = "Service"
-      identifiers = ["pods.eks.amazonaws.com"]
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_issuer_host_path}:sub"
+      values   = ["system:serviceaccount:${var.kubernetes_namespace}:${each.key}"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_issuer_host_path}:aud"
+      values   = ["sts.amazonaws.com"]
     }
   }
 }
 
-locals {
-  opensearch_arn = "arn:${data.aws_partition.current.partition}:es:${var.region}:${data.aws_caller_identity.current.account_id}:domain/${local.name}"
-}
-
 resource "aws_iam_role" "realtime_router" {
   name               = "${local.name}-realtime-router"
-  assume_role_policy = data.aws_iam_policy_document.pod_identity_trust.json
+  assume_role_policy = data.aws_iam_policy_document.irsa_trust["realtime-router"].json
 }
 
 resource "aws_iam_role_policy" "realtime_router" {
@@ -33,16 +58,9 @@ resource "aws_iam_role_policy" "realtime_router" {
   })
 }
 
-resource "aws_eks_pod_identity_association" "realtime_router" {
-  cluster_name    = module.eks.cluster_name
-  namespace       = var.kubernetes_namespace
-  service_account = "realtime-router"
-  role_arn        = aws_iam_role.realtime_router.arn
-}
-
 resource "aws_iam_role" "dashboard_api" {
   name               = "${local.name}-dashboard-api"
-  assume_role_policy = data.aws_iam_policy_document.pod_identity_trust.json
+  assume_role_policy = data.aws_iam_policy_document.irsa_trust["dashboard-api"].json
 }
 
 resource "aws_iam_role_policy" "dashboard_api" {
@@ -55,11 +73,4 @@ resource "aws_iam_role_policy" "dashboard_api" {
       Resource = ["${local.opensearch_arn}/*"]
     }]
   })
-}
-
-resource "aws_eks_pod_identity_association" "dashboard_api" {
-  cluster_name    = module.eks.cluster_name
-  namespace       = var.kubernetes_namespace
-  service_account = "dashboard-api"
-  role_arn        = aws_iam_role.dashboard_api.arn
 }

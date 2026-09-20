@@ -182,10 +182,11 @@ the account still use it.
 
 ## Cost
 
-With default sizes in us-west-2, on-demand pricing, the stack costs roughly **$0.90 per hour
-(about $650 per month)** before data transfer. The largest items are the EKS nodes
-(3 × t3.large, 2 × t3.medium), MSK (3 brokers), the EKS control plane, OpenSearch and
-ElastiCache. Run `./destroy.sh` when you're done.
+With default sizes in us-west-2, on-demand pricing, the stack costs roughly **$0.84 per hour
+(about $610 per month)** before data transfer. The largest items are the EKS nodes
+(3 × t4g.large, 2 × t4g.medium — Graviton, about 20% cheaper than the equivalent t3 sizes),
+MSK (3 brokers), the EKS control plane, OpenSearch and ElastiCache. Run `./destroy.sh` when
+you're done.
 
 ## Local dashboard development
 

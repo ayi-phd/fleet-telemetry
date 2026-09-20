@@ -71,6 +71,7 @@ resource "aws_lambda_function" "iot_kafka_bridge" {
   role          = aws_iam_role.iot_kafka_bridge.arn
   package_type  = "Image"
   image_uri     = local.image["iot-kafka-bridge"]
+  architectures = ["arm64"]
   timeout       = 10
   memory_size   = 256
 

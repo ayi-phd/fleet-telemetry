@@ -144,38 +144,90 @@ but can invoke Lambda. The user chose the Lambda on real AWS too, so both target
       errors" log-tail comment corrected (Kafka → Lambda invoke failures). The log group's name
       and value (`/aws/iot/<project>/rule-errors`) are unchanged; only the owning stack moved.
 
-## Phase 2: shared changes for both targets (Approved)
+## Phase 2: shared changes for both targets (Approved) — **done**
 
-- [ ] **2.1 arm64 everywhere.** Node groups on Graviton (`AL2023_ARM_64_STANDARD`, t4g.large core,
-      t4g.medium edge); `deploy.sh` builds `linux/arm64`; Lambda `architectures = ["arm64"]`.
-- [ ] **2.2 Replace the EKS module with plain resources**: `aws_eks_cluster`, `aws_eks_node_group`,
-      cluster and node IAM roles, `access_config { authentication_mode = "API_AND_CONFIG_MAP",
-      bootstrap_cluster_creator_admin_permissions = true }`. Keep node labels and the edge taint.
-      Node groups are skipped on Floci.
-- [ ] **2.3 No EKS add-ons block.** Rely on the default VPC CNI, kube-proxy and CoreDNS.
-- [ ] **2.4 No customer-managed KMS key for EKS secrets.**
-- [ ] **2.5 Pod Identity → IRSA.** `aws_iam_openid_connect_provider` with a static thumbprint (no
-      certificate fetch); `eks.amazonaws.com/role-arn` annotations on the `realtime-router` and
-      `dashboard-api` service accounts; delete both `aws_eks_pod_identity_association` resources
-      and swap the trust policy in `terraform/infra/iam_pods.tf`.
-- [ ] **2.6 MSK keeps SASL/SCRAM on AWS** (not IAM). Floci gets `unauthenticated = true`,
-      `client_broker = "PLAINTEXT"`, one broker, and no SCRAM secret / KMS key / association.
-- [ ] **2.7 No custom MSK configuration.** `aws_msk_configuration` becomes AWS-only, and
-      `platform.EnsureTopics` gains a configs map (`retention.ms`, `min.insync.replicas`) so topic
-      settings live in code. Nothing may rely on topic auto-creation.
-- [ ] **2.8 Scheduling.** The service module's `node_selector` default becomes `{}`; core/edge
-      placement moves to **preferred** node affinity plus the existing edge toleration, for the Go
-      services and the `web` Deployment.
-- [ ] **2.9 Remove the explicit NodePort security group rule**; `loadBalancerSourceRanges` on the
-      web Service already drives it. Verify on the Phase 5 AWS deploy.
-- [ ] **2.10 Simulator trusts a CA file** (`IOT_CA_FILE`, mounted from a secret): Amazon Root CA 1
-      on AWS (public, commit it), Floci's `/_floci/ca.pem` on Floci (fetched by `deploy.sh`).
-      Today it uses system roots, which don't include Floci's CA.
-- [ ] **2.11 `redis_address` output** becomes `coalesce(primary_endpoint_address,
-      configuration_endpoint_address)`. Floci fills only the configuration endpoint for
-      cluster-mode-disabled replication groups.
-- [ ] **2.12 OpenSearch index template `number_of_replicas`** becomes a setting (0 on Floci).
-- [ ] Update README for these (cost, prerequisites, security).
+- [x] **2.1 arm64 everywhere.** Node groups: `AL2023_ARM_64_STANDARD`, `t4g.large` core /
+      `t4g.medium` edge (`variables.tf` defaults changed from `t3.*`). `deploy.sh`'s shared
+      `build()` now passes `--platform linux/arm64` for every image (services, web, and the
+      Lambda). Lambda `architectures = ["arm64"]`. Dockerfile's `TARGETARCH` default and header
+      comment updated to match (buildx still sets it from `--platform` regardless).
+  - **Unverified**: no image has actually been built on this machine (Docker isn't running
+    here); first real check is the Phase 4 Floci deploy.
+- [x] **2.2 Replaced the EKS module with plain resources** (`terraform/infra/eks.tf`):
+      `aws_eks_cluster`, two `aws_eks_node_group`s, a cluster IAM role
+      (`AmazonEKSClusterPolicy`) and a node IAM role (`AmazonEKSWorkerNodePolicy`,
+      `AmazonEKS_CNI_Policy`, `AmazonEC2ContainerRegistryReadOnly`), `access_config` exactly as
+      planned. Node labels and the edge `NO_SCHEDULE` taint kept. Node groups are
+      `count = local.floci ? 0 : 1` — this is the first Floci-conditional resource in the
+      **infra** stack, so `variable "target"` / `local.floci` now exist there too (previously
+      only in platform; see Phase 1 notes). `terraform init -upgrade` on infra dropped the
+      `tls`/`time`/`cloudinit` providers the module pulled in — confirms they're gone.
+- [x] **2.3 No EKS add-ons block.** Simply omitted — EKS bootstraps default self-managed VPC
+      CNI, kube-proxy and CoreDNS on cluster/node-group creation with no addon resources needed;
+      this also removes the `eks-pod-identity-agent` addon, consistent with 2.5.
+- [x] **2.4 No customer-managed KMS key for EKS secrets.** Already true before this phase (the
+      original module block never set `cluster_encryption_config`) — confirmed, no code change.
+- [x] **2.5 Pod Identity → IRSA** (`terraform/infra/iam_pods.tf`): `aws_iam_openid_connect_provider`
+      with the well-known static placeholder thumbprint
+      (`9e99a48a9960b14926bb7f3b02e22da2b0ab7280` — AWS no longer validates this for an
+      issuer backed by a publicly trusted CA, which EKS's always is); per-service-account trust
+      policies (`sts:AssumeRoleWithWebIdentity`, `sub`/`aud` conditions) replacing the Pod
+      Identity trust doc; both `aws_eks_pod_identity_association` resources deleted. New infra
+      outputs `realtime_router_role_arn` / `dashboard_api_role_arn`; the platform stack's shared
+      service module gained `service_account_annotations` (maps to
+      `kubernetes_service_account_v1.metadata.annotations`), wired to
+      `eks.amazonaws.com/role-arn` for both service accounts.
+- [x] **2.6 MSK stays SASL/SCRAM on AWS.** No change made — documented only; IAM auth was the
+      option the user did not approve.
+- [x] **2.7 No custom MSK configuration.** Removed `aws_msk_configuration` and the cluster's
+      `configuration_info` block entirely (`terraform/infra/msk.tf`) rather than keeping it
+      AWS-only as an earlier draft of this plan said — the whole point is that Floci's MSK
+      emulation is unlikely to implement the configuration API at all, so nothing should depend
+      on broker-wide config either target. `platform.EnsureTopics` now takes `retention` and
+      `minInsyncReplicas` and sets them as **per-topic** configs via `kadm.CreateTopics`'
+      existing (previously unused, `nil`) configs parameter; `TOPIC_RETENTION` (`72h`) and
+      `TOPIC_MIN_INSYNC_REPLICAS` (`2`) are new env vars, set in
+      `terraform/platform/main.tf`'s `telemetry_processor` module alongside the existing
+      `TOPIC_PARTITIONS`/`TOPIC_REPLICATION`.
+  - **Carried into Phase 3**: `TOPIC_REPLICATION` is still hard-coded `"3"` for both targets
+    (pre-existing, not introduced by this phase) — invalid against Floci's single broker. Phase
+    3's "Sizing" row already covers making it `local.floci ? "1" : "3"`; left alone here to keep
+    this change scoped to what 2.7 asked for.
+- [x] **2.8 Scheduling.** The shared service module's `node_selector` var default is now `{}`,
+      and driving it no longer sets the Kubernetes `nodeSelector` field at all — instead it
+      builds a single **preferred** `node_affinity` term (one `preference` with a
+      `match_expressions` per key, so multi-key semantics match the old hard selector's AND).
+      The edge toleration is unchanged. Every caller that relied on the old
+      `{ workload = "core" }` default now passes it explicitly (`rbac_authz`,
+      `telemetry_processor`, `realtime_router`, `vehicle_simulator`); `dashboard_api` already
+      passed `{ workload = "edge" }` explicitly. `web.tf` doesn't use the shared module, so its
+      `kubernetes_deployment_v1.web` got the same affinity block hand-written.
+- [x] **2.9 Removed the `node_security_group_additional_rules` block** from `eks.tf` — it isn't
+      replaced by anything; `loadBalancerSourceRanges` on the web Service already makes the
+      in-tree NLB integration open exactly that CIDR range on the node/cluster security group.
+      To verify on the Phase 5 AWS deploy, per the original plan.
+- [x] **2.10 Simulator CA file.** `cmd/vehicle-simulator`: new `loadCAPool()` reads
+      `IOT_CA_FILE` (a PEM bundle) into an `x509.CertPool` used as `tls.Config.RootCAs`; empty
+      path falls back to `nil` (system roots), matching today's behavior when unset. Committed
+      `terraform/platform/certs/amazon-root-ca-1.pem` (fetched and verified against
+      `www.amazontrust.com`, valid until 2038); added as a `"ca.pem"` key in the existing
+      `vehicle-certs` secret (already mounted at `/certs`, so no new volume needed);
+      `IOT_CA_FILE=/certs/ca.pem` set on the `vehicle_simulator` module.
+  - **Known gap, deferred to Phase 3**: the committed file is Amazon's CA on **both** targets
+    for now. On Floci this won't verify the emulator's own broker certificate — end-to-end TLS
+    only works there once Phase 3's `deploy.sh` fetches Floci's real `/_floci/ca.pem` and this
+    secret's `ca.pem` key is swapped to use it instead.
+- [x] **2.11 `redis_address` fallback**: `coalesce(primary_endpoint_address,
+      configuration_endpoint_address)` in `terraform/infra/outputs.tf`.
+- [x] **2.12 OpenSearch index template `number_of_replicas`** is now `Persister.IndexReplicas`
+      (`internal/router/persist.go`), read from `OPENSEARCH_INDEX_REPLICAS`
+      (`cmd/realtime-router/main.go`, default `1`); the platform stack sets it to
+      `local.floci ? "0" : "1"` in the shared config map.
+- [x] **README**: cost figures updated for Graviton pricing (~$0.84/h, ~$610/mo; instance types
+      `t4g.large`/`t4g.medium`).
+
+Verified after every change in this phase: `make -C services build test`, `go vet ./...`,
+`terraform fmt -recursive`, `terraform validate` in both stacks, `npm run build`, `bash -n`.
 
 ## Phase 3: the Floci target
 
