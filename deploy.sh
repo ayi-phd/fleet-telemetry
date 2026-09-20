@@ -34,6 +34,7 @@ PROJECT="${PROJECT:-fleet-telemetry}"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
+warn() { printf '    \033[1;33m%s\033[0m\n' "$*"; }
 die()  { printf '\n\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 trap 'die "deploy stopped at line $LINENO. Fix the problem above and run ./deploy.sh again; finished steps are skipped."' ERR
 
@@ -190,10 +191,19 @@ for svc in "${LAMBDA_SERVICES[@]}"; do
 done
 build web "$ROOT/web/Dockerfile" "$ROOT/web"
 
-# Make sure the tag we pushed is what ECR actually has, before Kubernetes tries to pull it.
+# Make sure the tag we pushed is what the registry actually has, before Kubernetes
+# tries to pull it. Floci: confirmed on a live run that its ECR control-plane API
+# (DescribeImages) doesn't reflect what its registry actually serves - a push that
+# succeeds and pulls fine by tag still shows as absent there - so check the registry
+# itself (docker pull, the same mechanism kubelet uses) instead (PLAN.md Phase 4).
 for repo in "${SERVICES[@]}" "${LAMBDA_SERVICES[@]}" web; do
-  aws ecr describe-images --repository-name "$PROJECT/$repo" --image-ids "imageTag=$IMAGE_TAG" >/dev/null \
-    || die "Image $PROJECT/$repo:$IMAGE_TAG is missing from ECR after push."
+  if [[ "$TARGET" == "floci" ]]; then
+    docker pull "$REGISTRY/$PROJECT/$repo:$IMAGE_TAG" >/dev/null \
+      || die "Image $PROJECT/$repo:$IMAGE_TAG is missing from the registry after push."
+  else
+    aws ecr describe-images --repository-name "$PROJECT/$repo" --image-ids "imageTag=$IMAGE_TAG" >/dev/null \
+      || die "Image $PROJECT/$repo:$IMAGE_TAG is missing from ECR after push."
+  fi
 done
 
 # --------------------------------------------------------------------------
@@ -202,14 +212,93 @@ aws eks update-kubeconfig --name "$CLUSTER" --alias "$CLUSTER" >/dev/null
 info "kubectl context set to $CLUSTER"
 
 if [[ "$TARGET" == "floci" ]]; then
-  curl -fsS "$FLOCI_ENDPOINT/_floci/ca.pem" -o "$PLATFORM/floci-ca.pem" \
-    || die "Couldn't fetch Floci's CA certificate from $FLOCI_ENDPOINT/_floci/ca.pem."
+  # Floci's own containers (the ECR registry, MSK, OpenSearch, Valkey, ...) sit on
+  # Docker's plain default bridge network, which has no embedded DNS - confirmed on a
+  # live run that neither containerd (pulling images) nor pods can resolve another
+  # container by name there, even though they reach each other fine by IP. Worse,
+  # Kafka's protocol advertises MSK's broker container name (a randomly-suffixed
+  # "floci-msk-XXXXXX", not derivable from any Terraform output) in its metadata
+  # responses, so even a bootstrap address given as a plain IP isn't enough (PLAN.md
+  # Phase 4). Discover every "floci-*" container and its IP dynamically instead of
+  # guessing names. k3s's own node container is recreated on every apply (Floci
+  # re-deploys always recreate the EKS cluster; see PLAN.md's accepted Option (c)),
+  # so this runs, and re-patches both places below, on every deploy.
+  node_container="floci-eks-$PROJECT"
+  floci_hosts="" # newline-separated "ip name" pairs, no indentation (added by consumers)
+  while read -r cname; do
+    [[ "$cname" == "$node_container" ]] && continue
+    ip="$(docker inspect "$cname" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)"
+    [[ -z "$ip" ]] && continue
+    if [[ -z "$floci_hosts" ]]; then
+      floci_hosts="$ip $cname"
+    else
+      floci_hosts="$(printf '%s\n%s' "$floci_hosts" "$ip $cname")"
+    fi
+  done < <(docker ps --format '{{.Names}}' | grep '^floci-')
+
+  if docker inspect "$node_container" >/dev/null 2>&1; then
+    while read -r ip cname; do
+      docker exec "$node_container" sh -c "grep -q '[[:space:]]$cname\$' /etc/hosts || echo '$ip $cname' >> /etc/hosts"
+    done <<< "$floci_hosts"
+  else
+    warn "Couldn't find the Floci EKS node container ($node_container) to patch /etc/hosts; image pulls may fail to resolve."
+  fi
+
+  # The node-level /etc/hosts entries above only help containerd's image pulls (which
+  # use the node's own DNS); pods resolve names through cluster CoreDNS instead, which
+  # doesn't consult the node's /etc/hosts (k3s's own NodeHosts ConfigMap key is its
+  # cluster-node registry, not a copy of /etc/hosts, and gets overwritten by k3s - a
+  # dead end confirmed on a live run). Patching the same entries into CoreDNS's
+  # Corefile as a "hosts" block does survive, since k3s doesn't reconcile that key.
+  corefile=$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' 2>/dev/null) && [[ -n "$corefile" ]] || die "Couldn't read the CoreDNS Corefile to patch in Floci's container hostnames."
+  node_hosts=$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.NodeHosts}' 2>/dev/null)
+  if [[ -n "$floci_hosts" ]]; then
+    tmp_entries="$(mktemp)"
+    tmp_corefile="$(mktemp)"
+    printf '%s\n' "$floci_hosts" | sed 's/^/      /' > "$tmp_entries"
+    # sed's `r` command inserts a file's content after the matched line - unlike a
+    # substitution replacement, this has no issue with the inserted text spanning
+    # multiple lines, and is portable to BSD/macOS sed (which choked on this both as
+    # a multi-line `s///` replacement and as a multi-line `awk -v` string, tried
+    # first; a live run on this exact tool is what caught both).
+    sed -e "/hosts \/etc\/coredns\/NodeHosts {/r $tmp_entries" <<<"$corefile" > "$tmp_corefile"
+    rm -f "$tmp_entries"
+    if [[ -s "$tmp_corefile" ]]; then
+      kubectl -n kube-system create configmap coredns \
+        --from-file=Corefile="$tmp_corefile" --from-literal=NodeHosts="$node_hosts" \
+        --dry-run=client -o yaml | kubectl -n kube-system apply -f - >/dev/null
+    else
+      warn "Patching Floci's container hostnames into CoreDNS produced an empty Corefile; left it untouched."
+    fi
+    rm -f "$tmp_corefile"
+  fi
+  kubectl -n kube-system rollout restart deployment coredns >/dev/null
+  kubectl -n kube-system rollout status deployment coredns --timeout=60s >/dev/null \
+    || warn "CoreDNS didn't roll out after patching in Floci's hostnames; pod-level DNS for them may still fail."
+fi
+
+floci_creds_json=""
+if [[ "$TARGET" == "floci" ]]; then
+  # Not fatal: no confirmed real endpoint for this exists on Floci 1.5.x (this path
+  # 404s as an S3 NoSuchBucket, i.e. isn't routed as a Floci endpoint at all). The
+  # platform stack already falls back to the committed Amazon Root CA 1 when this
+  # file is absent (terraform/platform/simulator.tf), so the simulator still starts;
+  # its MQTT TLS trust just won't verify Floci's own broker cert until a real
+  # mechanism for this is found (PLAN.md Phase 4).
+  curl -fsS "$FLOCI_ENDPOINT/_floci/ca.pem" -o "$PLATFORM/floci-ca.pem" 2>/dev/null \
+    || warn "Couldn't fetch a Floci CA certificate from $FLOCI_ENDPOINT/_floci/ca.pem; falling back to the committed Amazon Root CA 1 (won't verify Floci's broker cert)."
+  # Floci's EKS emulation has no OIDC identity, so IRSA can't work there; realtime-router
+  # and dashboard-api use this IAM user's key as static OpenSearch credentials instead
+  # (see terraform/infra/iam_pods.tf and terraform/platform/main.tf).
+  floci_creds_json=",
+  \"floci_deploy_access_key_id\": \"$floci_key_id\",
+  \"floci_deploy_secret_access_key\": \"$floci_secret\""
 fi
 
 cat > "$PLATFORM/deploy.auto.tfvars.json" <<EOF
 {
   "image_tag": "$IMAGE_TAG",
-  "target": "$TARGET"
+  "target": "$TARGET"$floci_creds_json
 }
 EOF
 tf "$PLATFORM" init -input=false -upgrade >/dev/null

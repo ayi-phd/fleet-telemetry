@@ -14,6 +14,18 @@ variable "target" {
   }
 }
 
+variable "floci_deploy_access_key_id" {
+  description = "Floci-local IAM access key, used as static OpenSearch credentials for realtime-router and dashboard-api since Floci's EKS emulation has no OIDC identity for IRSA. Set by deploy.sh; unused on AWS."
+  type        = string
+  default     = ""
+}
+
+variable "floci_deploy_secret_access_key" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+
 variable "simulator_enabled" {
   type    = bool
   default = true

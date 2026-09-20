@@ -293,22 +293,125 @@ Verified after every change in this phase: `make -C services build test`, `go ve
 
 Resolve each open question; apply the fallback where the answer is no, and record the answer.
 
-| Question | Fallback |
+| Question | Answer |
 |---|---|
-| Does the Terraform AWS provider honour `AWS_ENDPOINT_URL`? | `dynamic "endpoints"` block on the Floci target |
-| Does Floci return pod-resolvable hostnames for MSK/RDS/ElastiCache/OpenSearch, or does it return `localhost`? | Rewrite the addresses in `platform/main.tf` to a Docker-network hostname (no rewriting logic written yet — genuinely unknown, see Phase 3 notes) |
-| Does Floci's `aws_iam_openid_connect_provider` accept the static placeholder thumbprint already in use (`9e99a48a9960b14926bb7f3b02e22da2b0ab7280`), and does creating an OIDC provider succeed there at all? | Real static thumbprint already in place; if OIDC itself fails on Floci, IRSA would need a Floci-only fallback (not designed yet) |
-| Does IoT deliver the protobuf bytes to the Lambda with `SELECT *`? | Rule SQL variant on Floci; the handler already accepts both forms |
-| Do plain EKS cluster, IAM roles and `access_config` succeed on Floci? | Already skipping node groups; fall back further if needed |
-| Does Docker push to the registry host `ecr_registry` now outputs for Floci? | `FLOCI_SERVICES_ECR_URI_STYLE=path` |
-| Does Floci's IoT support the CloudWatch error action (already assumed no and gated off)? | Already gated off; revisit only if Floci turns out to support it |
-| Does Floci's MSK accept TLS (already assumed no; plaintext implemented)? | Already plaintext; revisit only if Floci turns out to support TLS |
-| Does Floci's ElastiCache accept an auth token (already assumed no)? | Already no auth token on Floci; revisit if it turns out to work |
-| What scheme/port does Floci's OpenSearch emulation actually serve (`opensearch_endpoint` currently guesses `http://`)? | Adjust the scheme/port in `infra/outputs.tf` |
+| Does the Terraform AWS provider honour `AWS_ENDPOINT_URL`? | **Yes.** Confirmed throughout every live run in this phase; no `endpoints {}` block needed. |
+| Does Floci return pod-resolvable hostnames for MSK/RDS/ElastiCache/OpenSearch, or does it return `localhost`? | **All four needed a fix, for two different reasons.** OpenSearch (container-name hostname) and MSK (a *different* container-name hostname than the seed address, advertised via Kafka's own metadata protocol - see below) are resolvable in principle, but **nothing on Floci's default Docker bridge network can resolve any container by name at all** (no embedded DNS there - confirmed directly: `nslookup` from inside the k3s node container returns `NXDOMAIN` for a container that demonstrably exists, while reaching the same container by IP works fine). ElastiCache separately returns the literal string `"localhost"` for `primary_endpoint_address`, which is simply wrong at any layer. RDS returns a plain IP and needed no fix. **Fix implemented for all of it**: `deploy.sh` now discovers every `floci-*` container by name at deploy time and patches the resulting IP/name pairs into both the k3s node's `/etc/hosts` (for containerd's image pulls, which resolve at the node level) and CoreDNS's `Corefile` as a `hosts {}` block (for pod-level application traffic, which resolves through cluster DNS) - see Phase 4.5. `redis_address` also got a Floci-specific hostname override in Terraform, matching the pattern already used for `opensearch_endpoint`. |
+| Does Floci's `aws_iam_openid_connect_provider` accept the static placeholder thumbprint, and does creating an OIDC provider succeed there at all? | **No.** Floci's EKS emulation never populates `aws_eks_cluster.identity` (permanently empty, confirmed after 30+ minutes of an ACTIVE cluster) — there is no OIDC issuer to create a provider against. IRSA is AWS-only; Floci uses a static Floci-local IAM user's access key instead (Option A, see Phase 3.5 below). |
+| Does IoT deliver the protobuf bytes to the Lambda with `SELECT *`? | Still not reached - blocked behind the vehicle-simulator TLS issue below (nothing publishes to `fleet/telemetry` yet to test the rule against). |
+| Do plain EKS cluster, IAM roles and `access_config` succeed on Floci? | **Cluster creation succeeds** (reaches `ACTIVE`), with two caveats, both confirmed on live runs and both accepted rather than engineered around (Phase 4.5 below): a transient `FAILED` status during creation that self-resolves, and `access_config` never being echoed back on refresh (forces replacement on every subsequent apply). |
+| Does Docker push to the registry host `ecr_registry` now outputs for Floci? | **Yes, once our own bug was fixed** (see Phase 4.5: the doubled-project-name path). With the correct path, push, the k3s node's containerd pull, and `deploy.sh`'s own verification all work reliably. |
+| Does Floci's IoT support the CloudWatch error action (already assumed no and gated off)? | Not yet tested; still gated off. |
+| Does Floci's MSK accept TLS (already assumed no; plaintext implemented)? | Not yet tested; still plaintext. Kafka itself (topic creation, produce, consume) now works end to end between `telemetry-processor` and `realtime-router` once DNS was fixed. |
+| Does Floci's ElastiCache accept an auth token (already assumed no)? | Not yet tested; still no auth token. Confirmed working (`rbac-authz`'s fleet sync, `telemetry-processor`'s dedup) once the hostname fix landed. |
+| What scheme/port does Floci's OpenSearch emulation actually serve? | **`http://`, port 9200**, confirmed directly (`docker exec <container> curl http://localhost:9200`) — matches the guess already in place. |
+
+### Phase 4.5: additional findings from live runs, not in the original question list
+
+- [x] **`aws_iam_service_linked_role` (OpenSearch) fails on Floci**: `CreateServiceLinkedRole` returns `UnsupportedOperation`. Fixed: gated to AWS-only in `infra/datastores.tf` (it's only needed for a VPC-attached domain anyway, which is already AWS-only).
+- [x] **`aws_db_instance.storage_encrypted` force-replace loop**: Floci doesn't honor/report RDS storage encryption, so declaring `true` there caused an endless false→true diff. Fixed: `storage_encrypted = !local.floci`.
+- [x] **OpenSearch domain: two independent, unrelated blockers**, found via a live run:
+  1. Floci's `DescribeDomain.Processing` flag never clears (confirmed over 30+ minutes), even though the actual OpenSearch container (a real `opensearchproject/opensearch:2.17.1`) comes up and serves requests within about a minute. Terraform's create waiter can therefore never observe success.
+  2. Independently, `hashicorp/terraform-provider-aws` (v5.100.0, and still true on its current unreleased `main` branch — checked) has an unpatched nil-pointer bug: `flattenCognitoOptions` in `internal/service/opensearch/domain.go` dereferences `DescribeDomain`'s `CognitoOptions` field without a nil check. Real AWS always populates it (even when disabled); Floci omits it, and the provider segfaults on any refresh.
+
+  **Fix, discussed and approved with the user**: the native `aws_opensearch_domain` resource is now AWS-only (`count = local.floci ? 0 : 1`). On Floci, a `null_resource` with `local-exec` provisioners (create: `aws opensearch create-domain` + poll the real container via `docker exec ... curl`, since `Processing` can't be trusted; destroy: `aws opensearch delete-domain`) manages it directly instead — invoked automatically by the same `terraform apply`/`destroy` `deploy.sh`/`destroy.sh` already run, so this is not a new script (`CLAUDE.md`: exactly `deploy.sh` and `destroy.sh`). `opensearch_endpoint` is a hardcoded `http://floci-opensearch-<name>:9200` on Floci rather than a computed resource attribute, since there's no native resource to read it from. Unlike EKS/MSK/ElastiCache below, this resource **is** stable across re-deploys (its `triggers` don't change between runs, so Terraform doesn't recreate it every time) — a nicer property than the workaround needed elsewhere.
+- [x] **Broader pattern: Floci's `Describe*` responses omit several `ForceNew` fields set at creation**, causing perpetual destroy+recreate on every subsequent apply (not a one-time artifact — confirmed by re-planning a freshly-created, otherwise-untouched stack):
+  - EKS: the entire `access_config` block (including `bootstrap_cluster_creator_admin_permissions`).
+  - ElastiCache: `engine`.
+  - MSK: `broker_node_group_info` and `encryption_info`.
+
+  **Decision (discussed with the user): Option (c), documented and accepted, no code change.** The alternative fixes both have real costs: `lifecycle { ignore_changes = [...] }` can't be written as a `local.floci ? [...] : []` conditional (Terraform requires a literal list for that meta-argument), so applying it would mean either silently ignoring future changes to these attributes on **AWS too** (`CLAUDE.md`: "don't weaken AWS to suit Floci without the user's approval") or duplicating each affected resource block per target. Given these three resources create in seconds to about a minute on Floci once images are cached, the accepted trade-off is:
+
+  **On Floci, every `./deploy.sh` re-run fully destroys and recreates the EKS cluster, the MSK cluster and the ElastiCache replication group.** This means: node groups (if ever added on Floci) would be recreated, all MSK topics and their data are lost, and Redis's dedup/fleet-lookup cache is emptied — every deploy starts fresh. For a throwaway local-dev target this is acceptable; it would not be acceptable on AWS, where none of this occurs (confirmed idempotent there in every run so far).
+
+- [x] **A genuine bug in our own Phase 2 code, not Floci**: the shared service module's
+      (and `web.tf`'s) container-level `security_context` block set
+      `allow_privilege_escalation`/`read_only_root_filesystem`/`capabilities` but never
+      `run_as_non_root`. The Kubernetes provider serializes that as an explicit `false`,
+      which *overrides* the pod-level `run_as_non_root = true` (container-level wins),
+      violating the namespace's `restricted` Pod Security Standard outright:
+      `runAsNonRoot != true (container "X" must not set securityContext.runAsNonRoot=false)`.
+      Every pod failed to schedule at all until this was fixed. This would have failed
+      identically on real AWS with the same PSA label - Phase 4 is simply the first time
+      any of this code actually ran against a real Kubernetes API. Fixed by adding
+      `run_as_non_root = true` to the container-level block too, in both places.
+- [x] **A second genuine bug in our own Phase 3 code, not Floci**: `ecr_registry`'s
+      derivation (`infra/outputs.tf`) stripped only the *last* path segment of a real
+      `repository_url`, assuming its shape was `<host>/<reponame>`. It's actually
+      `<host>/<project>/<reponame>` (two segments, since `ecr.tf` names repos
+      `"${project}/${reponame}"`), so the "fixed" output still had `/<project>` on the
+      end. `deploy.sh` then built every image reference as
+      `$REGISTRY/$PROJECT/$repo`, appending the project name a *second* time
+      (`fleet-telemetry/fleet-telemetry/dashboard-api`). Every push, and `deploy.sh`'s own
+      post-push verification, silently used this wrong-but-internally-consistent path for
+      the entire session until caught - k3s's containerd, pulling the *correctly*-formed
+      path Terraform assembles independently for the Deployment spec, got `NAME_UNKNOWN`.
+      This produced a long chain of misleading symptoms (looked exactly like a registry
+      control-plane/GC bug) before a live inspection of the registry's own
+      `POST /_floci/ecr/gc` dry-run output - which lists every stored repo path - made
+      the doubling directly visible. Fixed: `ecr_registry` now takes just the first
+      (host) path segment.
+- [x] **No embedded DNS between Floci's own containers, at all** (not eviction, not a
+      "community edition" limit - both were considered and ruled out: the registry
+      container never restarted, has a real persistent volume, and its GC only marks
+      objects, never found anything eligible for deletion). Two independent consequences,
+      both needing a fix:
+  - containerd (image pulls, at the k3s **node** level) resolves via the node's own
+    `/etc/resolv.conf`, which points at Docker Desktop's VM resolver - never at Floci's
+    containers. Fixed in `deploy.sh`: after `aws eks update-kubeconfig`, discover every
+    `floci-*` container's IP and append it to the node container's `/etc/hosts`.
+  - Pods resolve via cluster CoreDNS, which does *not* consult the node's `/etc/hosts`.
+    k3s's own `NodeHosts` ConfigMap key looked promising (CoreDNS's Corefile already has
+    `hosts /etc/coredns/NodeHosts { ... fallthrough }`) but is k3s's live cluster-*node*
+    registry, not a copy of `/etc/hosts` - it gets reconciled back to just the node's own
+    self-entry, so edits there don't survive. Fixed in `deploy.sh`: patch the *same*
+    discovered entries directly into the `hosts` block already inside the Corefile
+    (which k3s does not reconcile), then restart CoreDNS to pick it up.
+  - Both patches re-run on every `deploy.sh` invocation, since Floci recreates the EKS
+    node container (and so its `/etc/hosts` and the fresh CoreDNS ConfigMap) on every
+    apply per the accepted Option (c) above.
+  - Portability note for whoever touches this next: building the multi-line `hosts{}`
+    insertion was tried three ways before landing on one that works on macOS's `sed`/
+    `awk` (which this machine uses) - a `sed` substitution with an embedded `\n` in the
+    replacement, then `awk -v block="<multi-line>"`, both failed silently or loudly on
+    BSD tools that GNU equivalents accept. What works, and is what's in `deploy.sh` now:
+    write the new lines to a temp file and use sed's `r` (read-file) command to insert
+    them after the matching line - this has no replacement-text parsing at all.
+  - This also means Kafka needed *two* different fixes, not one: the seed
+    `bootstrap_brokers` address Terraform outputs is a plain, reachable IP, but once
+    connected, MSK's broker advertises its *own* container name
+    (`floci-msk-<random-suffix>`, not derivable from any Terraform output) in Kafka's
+    metadata protocol, and clients reconnect to *that* for actual produce/consume. The
+    dynamic `floci-*` discovery above happens to cover this for free, since it patches
+    in whatever MSK container actually exists by name, not a hardcoded one.
+- [ ] **Still blocking, and not fixable in this repository**: Floci's IoT certificate
+      emulation is broken. `aws iot describe-certificate` returns
+      `"certificatePem": "-----BEGIN CERTIFICATE-----\n<the certificate's own hex ID>\n-----END CERTIFICATE-----"`
+      - the certificate ID wrapped in PEM armor, not a real X.509 certificate - confirmed
+      directly against the raw API response, not a parsing issue on our end. Every
+      `vehicle-simulator` connection fails immediately with `x509: malformed certificate`
+      before any TLS handshake is attempted. There is no code change available in this
+      repository that fixes Floci's own certificate generation; a workaround (e.g.
+      generating simulator certificates ourselves instead of relying on
+      `aws_iot_certificate`, and updating the IoT policy/simulator TLS setup to match)
+      would be a real design change requiring the user's decision, not something to pick
+      unilaterally. Not yet decided.
+
+**Status at the end of this session**: on a from-scratch Floci deploy, Stage 1 (infra)
+and Stage 2 (image build/push) complete cleanly and repeatably. In Stage 3,
+**`rbac-authz`, `telemetry-processor`, `realtime-router`, `dashboard-api` and `web` all
+reach `1/1 Running`** - the full pipeline from Postgres/Redis/Kafka/OpenSearch through to
+the dashboard is up. Only `vehicle-simulator` is blocked, on the IoT certificate issue
+above, which also means the IoT→Lambda→MSK leg of the pipeline (the actual telemetry
+path) is unverified end-to-end pending that decision.
 
 - [ ] End to end on Floci: simulator → IoT → Lambda → MSK → dashboard, with permission filtering
-      working for two users.
-- [ ] `TARGET=floci ./destroy.sh` removes everything.
+      working for two users. **Partially reached** — see status above; blocked on the
+      simulator TLS/certificate issue.
+- [ ] `TARGET=floci ./destroy.sh` removes everything. **Not yet verified** with the
+      current, much-more-complete platform stack (DNS patches, `null_resource`
+      OpenSearch, IRSA fallback) - worth a full destroy/recreate cycle once the
+      simulator question is resolved.
 
 ## Phase 5: verify on real AWS — **gated, needs separate human approval**
 
