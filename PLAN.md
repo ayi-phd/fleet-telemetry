@@ -84,38 +84,65 @@ a `dynamic "endpoints"` block in the provider is the fallback if that proves unr
   - The EKS module pin (`~> 20.31`) is moot: Phase 2 removes the module.
 - [x] `bash -n deploy.sh destroy.sh` — OK. `shellcheck` is not installed; not run.
 
-## Phase 1: IoT Core → Lambda → MSK (Decided, on AWS and Floci)
+## Phase 1: IoT Core → Lambda → MSK (Decided, on AWS and Floci) — **done**
 
 Why: Floci's IoT rules have no Kafka action and don't evaluate `${}` substitution templates,
 but can invoke Lambda. The user chose the Lambda on real AWS too, so both targets behave the same.
 
-- [ ] **New binary `services/cmd/iot-kafka-bridge`** (Go Lambda):
+- [x] **New binary `services/cmd/iot-kafka-bridge`** (Go Lambda):
   - `lambda.Handler` (`Invoke(ctx, []byte) ([]byte, error)`) so the payload arrives as raw bytes.
-  - Accept both input forms: raw protobuf bytes, and a JSON envelope with a base64 payload.
-  - Decode a copy of the protobuf only to read the VIN. Produce the **original bytes unmodified**
-    as the record value, key = VIN, header `ingest_ts` = receive time (ms).
-  - Reuse `internal/platform` Kafka config; create the client once per execution environment.
-    Produce synchronously; return an error on failure so the invocation retries.
-  - SCRAM credentials from the Lambda environment on AWS; plaintext on Floci.
-- [ ] **Image**: `services/Dockerfile --build-arg SERVICE=iot-kafka-bridge` on a Lambda-compatible
-      base (`public.ecr.aws/lambda/provided:al2023`, arm64); add to the `deploy.sh` build loop and
-      ECR checks, `terraform/infra/ecr.tf`, and the README service list.
-- [ ] **Terraform (platform stack)**: container-image `aws_lambda_function`,
-      `architectures = ["arm64"]`; `vpc_config` **only on AWS**; execution role;
-      `aws_lambda_permission` for `iot.amazonaws.com`; on-failure destination or DLQ on AWS;
-      move `aws_iot_topic_rule` here with `SELECT * FROM 'fleet/telemetry'` and a Lambda action.
-      Deploy after telemetry-processor so `raw-telemetry` exists.
-- [ ] **Terraform (infra stack)**: remove `aws_iot_topic_rule_destination.msk`,
-      `aws_iam_role.iot_destination` + policy, `aws_security_group.iot_destination`, and the rule
-      role's Secrets Manager/KMS statements.
-- [ ] **`destroy.sh`**: Lambda VPC network interfaces can take 20+ minutes to release; lengthen
-      the infra-destroy retry loop.
-- [ ] **README**: diagram, "How a position report travels", delivery guarantees, and these
-      accepted trade-offs:
-  - The Kafka key no longer proves which device sent a message. On AWS the IoT policy still
-    binds each connection to its own thing.
-  - Async invocation retries can reorder a vehicle's reports; telemetry-processor dedups and the
-    dashboard keeps the newest `deviceTimestamp` per VIN.
+  - Accepts both input forms: raw protobuf bytes, and a JSON envelope with a base64 `payload`.
+  - Decodes a copy of the protobuf only to read the VIN. Produces the **original bytes
+    unmodified** as the record value, key = VIN, header `ingest_ts` = receive time (ms).
+  - Reuses `platform.KafkaConfigFromEnv()`; one client per execution environment; synchronous
+    produce; returns an error on failure so the invocation retries.
+  - Credentials still come from `KAFKA_USERNAME`/`KAFKA_PASSWORD`/`KAFKA_TLS` like every other
+    service — no target-specific branching needed in Go code. The AWS/Floci split (SCRAM vs.
+    plaintext) is a Terraform decision deferred to Phase 2/3, since MSK's auth mode isn't
+    target-conditional yet.
+  - Unit tests written now (`bridge_test.go`, satisfies the Phase 6 item for this handler): VIN
+    extraction and keying, both input forms, value bytes unchanged, produce failure returns an
+    error. The success/failure paths use `github.com/twmb/franz-go/pkg/kfake` (in-memory broker)
+    rather than mocks, so they exercise the real `kgo` produce path.
+- [x] **Image**: `services/Dockerfile` now has two named final stages —
+      `runtime-standard` (existing distroless image) and `runtime-lambda`
+      (`public.ecr.aws/lambda/provided:al2023`; aws-lambda-go talks to the Runtime API itself,
+      no separate runtime interface client needed). `deploy.sh` now builds every service with an
+      explicit `--target` (no longer relying on "last stage wins"), added `LAMBDA_SERVICES`
+      alongside `SERVICES`, and added `iot-kafka-bridge` to `terraform/infra/ecr.tf` and the
+      README binary count.
+  - **Deviation from the plan text:** still `linux/amd64` / `x86_64`, matching every other
+    service today. arm64 is Phase 2 scope (2.1) and will flip the Lambda's `architectures`
+    together with the node groups, not ahead of it.
+  - **Unverified on this machine:** Docker isn't running here, so neither runtime-image build
+    has actually been built yet. First real verification is the Phase 4 Floci deploy.
+- [x] **Terraform (platform stack)**: `aws_lambda_function` (`package_type = "Image"`), execution
+      role, `aws_lambda_permission` for `iot.amazonaws.com`, `aws_iot_topic_rule` with
+      `SELECT * FROM 'fleet/telemetry'` and a `lambda` action (`terraform/platform/lambda.tf`,
+      `iot.tf`). `vpc_config` and the on-failure SQS destination are gated `local.floci ? ... `
+      (only on AWS) — this introduces `variable "target"` / `local.floci` into the **platform**
+      stack now, since this is the first Floci-conditional resource; the **infra** stack doesn't
+      need it yet and doesn't have it (deploy.sh still doesn't set `TARGET`; Phase 3 wires that).
+  - **Deviation:** did not add `depends_on = [module.telemetry_processor]`. MSK's
+    `auto.create.topics.enable=true` (unchanged until Phase 2.7) already covers topic existence,
+    matching how the original rule had no such dependency either.
+- [x] **Terraform (infra stack)**: removed `aws_iot_topic_rule_destination.msk`,
+      `aws_iam_role.iot_destination` + policy, `aws_security_group.iot_destination`, the rule
+      role's Secrets Manager/KMS statements, and `aws_iot_topic_rule.telemetry_to_msk` itself.
+      Added `output "private_subnet_ids"` for the platform stack's Lambda VPC config.
+      `aws_iot_policy.vehicle` and `data.aws_iot_endpoint.ats` stay in infra (no image needed).
+- [x] **`destroy.sh`**: lengthened the infra-destroy retry loop (3 attempts/60s →
+      4 attempts/5 min). Also found and fixed a related gap: the Lambda's security group now
+      lives in the **platform** stack (it's created there, alongside the function), so *that*
+      stack's destroy can itself get stuck on a `DependencyViolation` while the ENI releases —
+      wrapped the platform destroy step in the same kind of retry loop before its existing
+      "cluster already gone" fallback.
+  - **Not verified end to end** (no real Lambda has been created/destroyed yet); the 20+ minute
+    Lambda-ENI-release behavior is documented AWS behavior, not something observed here.
+- [x] **README**: diagram, "How a position report travels" step 2 rewritten for the Lambda path,
+      both accepted trade-offs stated inline, binary count corrected to six, and the "IoT rule
+      errors" log-tail comment corrected (Kafka → Lambda invoke failures). The log group's name
+      and value (`/aws/iot/<project>/rule-errors`) are unchanged; only the owning stack moved.
 
 ## Phase 2: shared changes for both targets (Approved)
 

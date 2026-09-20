@@ -101,17 +101,3 @@ resource "aws_security_group" "opensearch" {
   }
   lifecycle { create_before_destroy = true }
 }
-
-resource "aws_security_group" "iot_destination" {
-  name_prefix = "${local.name}-iot-"
-  description = "ENIs used by the IoT Core VPC rule destination to reach MSK"
-  vpc_id      = module.vpc.vpc_id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = [var.vpc_cidr]
-  }
-  lifecycle { create_before_destroy = true }
-}

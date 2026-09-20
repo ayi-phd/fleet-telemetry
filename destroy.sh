@@ -58,10 +58,18 @@ fi
 # --------------------------------------------------------------------------
 step "1/3: Removing workloads, the dashboard load balancer and simulated IoT devices"
 if has_state "$PLATFORM"; then
-  if ! tf "$PLATFORM" destroy -input=false -auto-approve; then
+  # The iot-kafka-bridge Lambda's security group can't be deleted until AWS finishes
+  # releasing its ENI, which can take several minutes after the function is gone.
+  platform_destroyed=0
+  for attempt in 1 2 3; do
+    if tf "$PLATFORM" destroy -input=false -auto-approve; then platform_destroyed=1; break; fi
+    warn "Attempt $attempt didn't finish; the Lambda's network interface may still be releasing."
+    [[ $attempt -lt 3 ]] && { info "Retrying in 60 seconds."; sleep 60; }
+  done
+  if [[ $platform_destroyed -eq 0 ]]; then
     # Usually means the EKS cluster is already gone, so the Kubernetes provider can't
     # connect. Kubernetes objects died with the cluster; forget them and destroy
-    # the remaining AWS resources (IoT things and certificates).
+    # the remaining AWS resources (IoT things, certificates, the Lambda and its role).
     warn "Platform destroy failed. Retrying without Kubernetes objects (the cluster may already be gone)."
     tf "$PLATFORM" state list 2>/dev/null | grep -E '(^|\.)kubernetes_' | while read -r addr; do
       tf "$PLATFORM" state rm "$addr" >/dev/null
@@ -123,11 +131,13 @@ cleanup_vpc_leftovers() {
 
 if has_state "$INFRA"; then
   destroyed=0
-  for attempt in 1 2 3; do
+  # The iot-kafka-bridge Lambda's ENIs (platform stack) can take 20+ minutes to release
+  # after the function is deleted, and block subnet/VPC deletion here until they do.
+  for attempt in 1 2 3 4; do
     if tf "$INFRA" destroy -input=false -auto-approve; then destroyed=1; break; fi
     warn "Attempt $attempt didn't finish; AWS is probably still releasing network interfaces."
     cleanup_vpc_leftovers
-    [[ $attempt -lt 3 ]] && { info "Retrying in 60 seconds."; sleep 60; }
+    [[ $attempt -lt 4 ]] && { info "Retrying in 5 minutes."; sleep 300; }
   done
 
   if [[ $destroyed -eq 0 ]]; then

@@ -1,5 +1,5 @@
 locals {
-  images = toset(["telemetry-processor", "realtime-router", "dashboard-api", "rbac-authz", "vehicle-simulator", "web"])
+  images = toset(["telemetry-processor", "realtime-router", "dashboard-api", "rbac-authz", "vehicle-simulator", "iot-kafka-bridge", "web"])
 }
 
 resource "aws_ecr_repository" "this" {

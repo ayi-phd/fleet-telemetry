@@ -15,8 +15,9 @@ Everything runs on AWS and is created by one script and removed by another:
 
 ```mermaid
 flowchart LR
-  V[Vehicles<br/>protobuf over MQTT] -->|fleet/telemetry| IOT[AWS IoT Core<br/>topic rule]
-  IOT -->|raw-telemetry| K1[(MSK)]
+  V[Vehicles<br/>protobuf over MQTT] -->|fleet/telemetry| IOT[IoT Core<br/>topic rule]
+  IOT -->|invoke| LAM[iot-kafka-bridge<br/>Lambda]
+  LAM -->|raw-telemetry| K1[(MSK)]
   K1 --> TP[telemetry-processor]
   TP <-->|dedup + VIN→fleet| R[(ElastiCache Redis)]
   TP -->|canonical-events| K2[(MSK)]
@@ -32,9 +33,16 @@ flowchart LR
 1. **Vehicles** publish a `telemetry.v1.VehicleTelemetry` protobuf (`proto/telemetry/v1`) to
    `fleet/telemetry`. Each vehicle is an IoT thing with its own X.509 certificate; the IoT policy
    lets a device connect only under its own thing name and publish only to that topic.
-2. **IoT Core** forwards every message unchanged to Kafka topic `raw-telemetry` through a VPC
-   rule destination, keyed by client ID (the VIN) so each vehicle's reports stay in order.
-   It adds an `ingest_ts` header. Failed deliveries are logged to CloudWatch.
+2. **IoT Core** invokes the **iot-kafka-bridge** Lambda for every message (a topic rule with a
+   Lambda action; Floci's IoT rules can invoke Lambda but have no native Kafka action, so both
+   targets use the same path). The function reads only the VIN, then republishes the original
+   protobuf bytes to Kafka topic `raw-telemetry` unmodified, keyed by VIN so each vehicle's
+   reports stay in one partition, with an `ingest_ts` header set to the receive time. Failed
+   rule deliveries are logged to CloudWatch; exhausted async retries land in a dead-letter
+   queue. Two accepted trade-offs: the Kafka key no longer proves which device sent a message
+   (on AWS the IoT policy still binds each connection to its own thing), and async retries can
+   reorder a vehicle's reports, which telemetry-processor's deduplication and the dashboard's
+   newest-`deviceTimestamp`-per-VIN handling both tolerate.
 3. **telemetry-processor** decodes and validates each message, drops duplicates using Redis,
    looks up the vehicle's fleet in Redis, and publishes JSON to `canonical-events`.
    Invalid messages go to `raw-telemetry-dlq`. Vehicles with no fleet are tagged `UNASSIGNED`.
@@ -78,7 +86,7 @@ come and go.
 ```
 deploy.sh, destroy.sh     the only two scripts
 proto/                    protobuf contracts: telemetry, router gRPC stream, authz gRPC
-services/                 one Go module, five binaries (cmd/*), shared code in internal/
+services/                 one Go module, six binaries (cmd/*), shared code in internal/
   Dockerfile              builds any service: --build-arg SERVICE=<name>
 web/                      React + Leaflet dashboard, served by nginx
 terraform/infra/          stage 1: VPC, EKS, MSK, ElastiCache, RDS, OpenSearch, IoT Core, ECR, IAM
@@ -195,7 +203,7 @@ API_TARGET=http://<dashboard_url> npm run dev
 kubectl -n fleet get pods
 kubectl -n fleet logs -l app=telemetry-processor -f
 kubectl -n fleet logs -l app=realtime-router -f
-aws logs tail /aws/iot/fleet-telemetry/rule-errors --follow   # IoT → Kafka delivery failures
+aws logs tail /aws/iot/fleet-telemetry/rule-errors --follow   # IoT → Lambda invoke failures
 ```
 
 Every Go service serves `/healthz`, `/readyz` and Prometheus `/metrics` on port 8081
