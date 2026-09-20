@@ -229,39 +229,65 @@ but can invoke Lambda. The user chose the Lambda on real AWS too, so both target
 Verified after every change in this phase: `make -C services build test`, `go vet ./...`,
 `terraform fmt -recursive`, `terraform validate` in both stacks, `npm run build`, `bash -n`.
 
-## Phase 3: the Floci target
+## Phase 3: the Floci target — **done** (unverified against a live Floci; that's Phase 4)
 
-| Area | Floci | File |
-|---|---|---|
-| VPC | `enable_nat_gateway = false` (`CreateNatGateway` unsupported) | `infra/network.tf` |
-| EKS | cluster only, no node groups | `infra/eks.tf` |
-| MSK | 1 broker, plaintext, unauthenticated, no configuration/SCRAM/KMS | `infra/msk.tf` |
-| ElastiCache | no subnet group (`CreateCacheSubnetGroup` unsupported), 1 node, no failover/multi-AZ, no TLS or auth token | `infra/datastores.tf` |
-| RDS | `sslmode=disable` in `postgres_dsn` | `infra/outputs.tf` |
-| OpenSearch | 1 instance, no zone awareness, no `vpc_options`, no encryption blocks | `infra/datastores.tf` |
-| IoT | no VPC destination; CloudWatch error action gated; `iot_endpoint` overridable by variable | `infra/iot.tf` |
-| ECR | registry host from `aws_ecr_repository.repository_url` | `infra/outputs.tf` |
-| Endpoints seen by pods | MSK/Redis/PostgreSQL/OpenSearch addresses rewritten to a hostname pods can resolve when Floci returns `localhost` | `platform/main.tf` |
-| Secrets/config | `KAFKA_TLS=false`, empty `KAFKA_USERNAME`, `REDIS_TLS=false`, no Redis password, `TOPIC_REPLICATION=1` | `platform/main.tf` |
-| Replicas | 1 per service | `platform/variables.tf` |
-| Web exposure | `NodePort`, `wait_for_load_balancer = false`, `dashboard_url` guarded | `platform/web.tf`, `platform/outputs.tf` |
-| Lambda | no `vpc_config` | `platform/lambda.tf` |
+| Area | Floci | File | Status |
+|---|---|---|---|
+| VPC | `enable_nat_gateway = !local.floci` | `infra/network.tf` | [x] |
+| EKS | cluster only, no node groups | `infra/eks.tf` | [x] already done in Phase 2 |
+| MSK | 1 broker, plaintext, unauthenticated, no configuration/SCRAM/KMS | `infra/msk.tf` | [x] |
+| ElastiCache | no subnet group, 1 node, no failover/multi-AZ, no TLS or auth token | `infra/datastores.tf` | [x] |
+| RDS | `sslmode=disable` in `postgres_dsn` | `infra/outputs.tf` | [x] |
+| OpenSearch | 1 instance, no zone awareness, no `vpc_options`, no encryption blocks | `infra/datastores.tf` | [x] |
+| IoT | CloudWatch error action gated; `iot_endpoint` overridable by `iot_endpoint_override` | `infra/variables.tf`, `platform/iot.tf` | [x] |
+| ECR | registry host derived from a real `repository_url` (now target-agnostic, not just Floci) | `infra/outputs.tf` | [x] |
+| Endpoints seen by pods | MSK/Redis/PostgreSQL/OpenSearch addresses rewritten if Floci returns `localhost` | `platform/main.tf` | **deferred to Phase 4** — genuinely unknown without a live Floci; see below |
+| Secrets/config | `KAFKA_TLS`/`REDIS_TLS=false`, empty `KAFKA_USERNAME`/password, `TOPIC_REPLICATION`/`TOPIC_MIN_INSYNC_REPLICAS=1` | `platform/main.tf` | [x] |
+| Replicas | 1 per service, via `local.replicas` overriding `var.replicas` | `platform/main.tf` | [x] |
+| Web exposure | `NodePort`, `wait_for_load_balancer = false`, `dashboard_url` a port-forward hint | `platform/web.tf`, `platform/outputs.tf` | [x] |
+| Lambda | no `vpc_config`, no DLQ/event-invoke-config | `platform/lambda.tf` | [x] already done in Phase 1/2 |
+| Simulator CA | Floci's real `/_floci/ca.pem`, fetched by `deploy.sh` | `simulator.tf`, `deploy.sh` | [x] |
 
-- [ ] `deploy.sh`: `TARGET` (default `aws`) saved into both `deploy.auto.tfvars.json`.
-- [ ] `deploy.sh` on Floci: verify Floci is reachable (`/_floci/health`) and configured — k3s and
-      Floci on one Docker network (`FLOCI_SERVICES_DOCKER_NETWORK` /
-      `FLOCI_SERVICES_EKS_DOCKER_NETWORK`), `FLOCI_TLS_ENABLED=true`,
-      `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS` set to a pod-resolvable hostname. If not, fail with
-      the exact command and settings to use.
-- [ ] `deploy.sh` on Floci: export `AWS_ENDPOINT_URL` and credentials; create an IAM user and
-      access key for EKS auth (`test`/`test` is rejected); fetch `/_floci/ca.pem`; build
-      `linux/arm64`; push to the Floci ECR registry (default `hostname` URI style, fallback
-      `FLOCI_SERVICES_ECR_URI_STYLE=path`); skip the NLB wait and print a `kubectl port-forward`
-      command instead of a URL.
-- [ ] `destroy.sh`: read the saved target; gate the AWS-only sweeps
-      (`resourcegroupstaggingapi`, `elbv2`, ENI and `k8s-*` security-group cleanup, kubeconfig
-      removal) behind `target == aws`; leave the Floci container running.
-- [ ] README: "Running on Floci" section.
+- [x] **`deploy.sh`**: `TARGET` (`aws`\|`floci`, validated) saved into both stacks'
+      `deploy.auto.tfvars.json`.
+- [x] **`deploy.sh` on Floci**: checks `$FLOCI_ENDPOINT/_floci/health` and dies with the
+      settings needed (network, TLS, IoT endpoint hostname) if unreachable — never starts Floci
+      itself. Exports `AWS_ENDPOINT_URL` and `AWS_REGION` (default `us-east-1`, matching
+      `floci env`). Creates a Floci-local IAM user (`floci_ensure_deploy_credentials`) and
+      caches its access key in `.floci-deploy-key` (gitignored, `chmod 600`) for `aws eks
+      get-token`, since Floci accepts `test`/`test` for most calls but rejects it for that one.
+      Fetches `/_floci/ca.pem` into `terraform/platform/floci-ca.pem` before the platform apply.
+      Skips the NLB wait; the final summary prints `dashboard_url` as-is, which on Floci is
+      already a `kubectl port-forward` instruction rather than a URL.
+  - **Not done**: the `FLOCI_SERVICES_ECR_URI_STYLE=path` fallback and arch-specific push
+    quirks — nothing to write until Phase 4 shows whether the default registry hostname style
+    actually works.
+- [x] **`destroy.sh`**: reads `target` from the infra state (not from the environment), so
+      destroy always matches what deploy created. Verifies Floci reachability and picks up the
+      cached deploy credentials the same way. Skips the load-balancer sweep entirely and uses
+      a single, fast destroy attempt (no Lambda-ENI or NAT-gateway waits apply). Floci itself is
+      never touched.
+  - **Found while doing this**: destroy.sh's region-mismatch guard checked for the stale
+    `module.eks` state address (dead since Phase 2 replaced the module) — fixed to
+    `aws_eks_cluster.this`, and extended with the same guard for a target mismatch.
+- [x] **README**: "Running on Floci" section.
+
+**Deferred to Phase 4 (open questions, not implementation gaps):**
+
+- *Endpoints seen by pods.* Whether Floci's MSK/RDS/ElastiCache/OpenSearch endpoints are
+  already pod-resolvable, or need rewriting to a Docker-network hostname in `platform/main.tf`,
+  cannot be determined without a running Floci. No blind rewriting logic was written; Phase 4's
+  fallback table already owns this question.
+- The committed `terraform/platform/certs/amazon-root-ca-1.pem` is used as the simulator's
+  `ca.pem` on Floci until `floci-ca.pem` exists (Phase 2's noted gap); `deploy.sh` now fetches
+  the real one on every Floci run, so this fallback should only ever be visible on a first,
+  partial run.
+- `terraform validate` passes for both stacks (default `target=aws`). A `terraform plan
+  -var target=floci` was also attempted here (no live Floci, dummy credentials): it got past
+  generating the plan for every non-AWS-API resource and correctly resolved `target = "floci"`
+  and `msk_username = ""` in the output diff, then failed at the AWS provider's own
+  `GetCallerIdentity` check — expected without a reachable endpoint, and about as far as this
+  can be verified before Phase 4's live run.
 
 ## Phase 4: first Floci run
 
@@ -270,13 +296,15 @@ Resolve each open question; apply the fallback where the answer is no, and recor
 | Question | Fallback |
 |---|---|
 | Does the Terraform AWS provider honour `AWS_ENDPOINT_URL`? | `dynamic "endpoints"` block on the Floci target |
-| Does Floci return pod-resolvable hostnames for MSK/RDS/ElastiCache/OpenSearch? | Override the addresses in the platform stack |
-| Does `aws_iam_openid_connect_provider` accept no thumbprint? | Static thumbprint |
+| Does Floci return pod-resolvable hostnames for MSK/RDS/ElastiCache/OpenSearch, or does it return `localhost`? | Rewrite the addresses in `platform/main.tf` to a Docker-network hostname (no rewriting logic written yet — genuinely unknown, see Phase 3 notes) |
+| Does Floci's `aws_iam_openid_connect_provider` accept the static placeholder thumbprint already in use (`9e99a48a9960b14926bb7f3b02e22da2b0ab7280`), and does creating an OIDC provider succeed there at all? | Real static thumbprint already in place; if OIDC itself fails on Floci, IRSA would need a Floci-only fallback (not designed yet) |
 | Does IoT deliver the protobuf bytes to the Lambda with `SELECT *`? | Rule SQL variant on Floci; the handler already accepts both forms |
 | Do plain EKS cluster, IAM roles and `access_config` succeed on Floci? | Already skipping node groups; fall back further if needed |
-| Does Docker push to `*.dkr.ecr.<region>.localhost:4566`? | `FLOCI_SERVICES_ECR_URI_STYLE=path` |
-| Does Floci's IoT support the CloudWatch error action? | Drop it on Floci |
-| Do Floci's MSK and Valkey accept TLS? | Plaintext on Floci |
+| Does Docker push to the registry host `ecr_registry` now outputs for Floci? | `FLOCI_SERVICES_ECR_URI_STYLE=path` |
+| Does Floci's IoT support the CloudWatch error action (already assumed no and gated off)? | Already gated off; revisit only if Floci turns out to support it |
+| Does Floci's MSK accept TLS (already assumed no; plaintext implemented)? | Already plaintext; revisit only if Floci turns out to support TLS |
+| Does Floci's ElastiCache accept an auth token (already assumed no)? | Already no auth token on Floci; revisit if it turns out to work |
+| What scheme/port does Floci's OpenSearch emulation actually serve (`opensearch_endpoint` currently guesses `http://`)? | Adjust the scheme/port in `infra/outputs.tf` |
 
 - [ ] End to end on Floci: simulator → IoT → Lambda → MSK → dashboard, with permission filtering
       working for two users.

@@ -38,11 +38,11 @@ resource "kubernetes_secret_v1" "sim_certs" {
   data = merge(
     { for v in local.sim_vins : "${v}.cert.pem" => aws_iot_certificate.sim[v].certificate_pem },
     { for v in local.sim_vins : "${v}.key.pem" => aws_iot_certificate.sim[v].private_key },
-    # Amazon Root CA 1, so the simulator doesn't fall back to system roots (which don't
-    # include it). Floci-only: this is a placeholder until Phase 3's deploy.sh fetches
-    # Floci's own broker CA and swaps it in here - broker TLS verification stays broken
-    # on Floci until then.
-    { "ca.pem" = file("${path.module}/certs/amazon-root-ca-1.pem") },
+    # Amazon Root CA 1 on AWS, so the simulator doesn't fall back to system roots
+    # (which don't include it). On Floci, deploy.sh fetches its real broker CA to
+    # floci-ca.pem before applying this stack; try() falls back to the Amazon cert
+    # (which won't verify Floci's broker) only if that hasn't happened yet.
+    { "ca.pem" = local.floci ? try(file("${path.module}/floci-ca.pem"), file("${path.module}/certs/amazon-root-ca-1.pem")) : file("${path.module}/certs/amazon-root-ca-1.pem") },
   )
 }
 

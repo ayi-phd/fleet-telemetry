@@ -109,3 +109,9 @@ variable "kubernetes_namespace" {
   type        = string
   default     = "fleet"
 }
+
+variable "iot_endpoint_override" {
+  description = "Overrides the iot_endpoint output. Floci: a pod-resolvable hostname for its IoT emulation, set by deploy.sh, since data.aws_iot_endpoint may not return one pods can reach. Empty uses the data source."
+  type        = string
+  default     = ""
+}

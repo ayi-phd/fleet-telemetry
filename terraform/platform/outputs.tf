@@ -1,9 +1,10 @@
 locals {
-  lb_ingress = kubernetes_service_v1.web.status[0].load_balancer[0].ingress[0]
+  # A NodePort Service (Floci) never populates status.load_balancer.
+  lb_ingress = local.floci ? null : kubernetes_service_v1.web.status[0].load_balancer[0].ingress[0]
 }
 
 output "dashboard_url" {
-  value = "http://${coalesce(local.lb_ingress.hostname, local.lb_ingress.ip)}"
+  value = local.floci ? "kubectl -n ${local.ns} port-forward svc/web 8080:80  # then open http://localhost:8080" : "http://${coalesce(local.lb_ingress.hostname, local.lb_ingress.ip)}"
 }
 
 output "demo_users" {
@@ -25,5 +26,5 @@ output "simulated_vins" {
 }
 
 output "iot_rule_error_log_group" {
-  value = aws_cloudwatch_log_group.iot_rule_errors.name
+  value = local.floci ? "" : aws_cloudwatch_log_group.iot_rule_errors[0].name
 }

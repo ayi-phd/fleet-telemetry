@@ -7,6 +7,10 @@ crash.log
 deploy.auto.tfvars.json
 *.tfvars
 !example.tfvars
+# Fetched from a running Floci by deploy.sh (TARGET=floci); not the committed AWS CA
+terraform/platform/floci-ca.pem
+# A Floci-local IAM access key, meaningless outside that Floci instance
+.floci-deploy-key
 
 # Build output
 .build-*.log
