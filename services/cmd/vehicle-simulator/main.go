@@ -6,6 +6,11 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -37,6 +42,36 @@ func main() {
 	dupRate := platform.EnvFloat("DUPLICATE_RATE", 0.03)
 	centerLat := platform.EnvFloat("CENTER_LAT", 37.7749)
 	centerLng := platform.EnvFloat("CENTER_LNG", -122.4194)
+	// IOT_TLS mirrors KAFKA_TLS/REDIS_TLS elsewhere: true on AWS (real IoT Core requires
+	// mutual TLS on 8883). false only on Floci, whose 8883 listener never completes a TLS
+	// handshake regardless of client certificate (confirmed directly against the raw
+	// socket - PLAN.md Phase 4), unlike its plaintext MQTT broker on 1883, which works.
+	tlsEnabled := platform.EnvBool("IOT_TLS", true)
+	// IOT_WIRE_JSON: Floci only. Its IoT rules engine forces every MQTT payload through
+	// UTF-8 decoding before any rule SQL runs, silently replacing invalid byte sequences
+	// with U+FFFD - confirmed by inspecting the exact bytes the Lambda received, which
+	// were the original protobuf with every non-UTF8 byte corrupted this way. No rule SQL
+	// variant works around it, since the corruption happens before SQL evaluation (PLAN.md
+	// Phase 4). Publishing a UTF-8-safe JSON envelope instead of raw protobuf bytes avoids
+	// the corruption; iot-kafka-bridge already unwraps exactly this envelope
+	// (decodePayload's base64 "payload" field) and forwards the original, unmodified
+	// protobuf bytes to Kafka, so telemetry-processor sees identical records on both
+	// targets. AWS keeps the real wire format: protobuf bytes, no envelope.
+	wireJSON := platform.EnvBool("IOT_WIRE_JSON", false)
+
+	// IOT_CA_FILE is the CA that signs the broker's TLS certificate: Amazon Root CA 1 on
+	// AWS. Not in the system trust store, so without it the connection fails closed
+	// rather than silently trusting nothing extra. Unused when IOT_TLS is false.
+	var caPool *x509.CertPool
+	if tlsEnabled {
+		caFile := platform.Env("IOT_CA_FILE", "")
+		var err error
+		caPool, err = loadCAPool(caFile)
+		if err != nil {
+			log.Error("load IoT CA file", "file", caFile, "err", err)
+			os.Exit(1)
+		}
+	}
 
 	vins, err := discoverVINs(certDir)
 	if err != nil || len(vins) == 0 {
@@ -57,7 +92,7 @@ func main() {
 			case <-time.After(time.Duration(i) * 200 * time.Millisecond):
 			}
 			v := newVehicle(vin, centerLat, centerLng)
-			if err := v.run(ctx, endpoint, certDir, interval, dupRate); err != nil {
+			if err := v.run(ctx, endpoint, certDir, interval, dupRate, tlsEnabled, wireJSON, caPool); err != nil {
 				log.Error("vehicle stopped", "vin", vin, "err", err)
 			}
 		}(i, vin)
@@ -77,6 +112,24 @@ func discoverVINs(dir string) ([]string, error) {
 	}
 	sort.Strings(vins)
 	return vins, nil
+}
+
+// loadCAPool reads a PEM CA bundle for trusting the IoT broker's TLS certificate.
+// An empty path falls back to nil, meaning "trust the system's root store" - today's
+// behavior, kept for anyone running the simulator without IOT_CA_FILE configured.
+func loadCAPool(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, nil
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("no certificates found in %s", path)
+	}
+	return pool, nil
 }
 
 type vehicle struct {
@@ -139,24 +192,29 @@ func (v *vehicle) step(dt time.Duration) {
 	v.soc = math.Max(0, math.Min(100, v.soc))
 }
 
-func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval time.Duration, dupRate float64) error {
-	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, v.vin+".cert.pem"), filepath.Join(certDir, v.vin+".key.pem"))
-	if err != nil {
-		return err
-	}
+func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval time.Duration, dupRate float64, tlsEnabled, wireJSON bool, caPool *x509.CertPool) error {
 	opts := mqtt.NewClientOptions().
-		AddBroker("tls://" + endpoint + ":8883").
 		SetClientID(v.vin).
-		SetTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}).
 		SetKeepAlive(30 * time.Second).
 		SetCleanSession(true).
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(5 * time.Second)
+	if tlsEnabled {
+		cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, v.vin+".cert.pem"), filepath.Join(certDir, v.vin+".key.pem"))
+		if err != nil {
+			return err
+		}
+		opts.AddBroker("tls://" + endpoint + ":8883").
+			SetTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: caPool, MinVersion: tls.VersionTLS12})
+	} else {
+		opts.AddBroker("tcp://" + endpoint + ":1883")
+	}
 	client := mqtt.NewClient(opts)
 	if tok := client.Connect(); tok.Wait() && tok.Error() != nil {
 		return tok.Error()
 	}
+	slog.Info("connected to IoT broker", "vin", v.vin, "tls", tlsEnabled)
 	defer client.Disconnect(250)
 
 	t := time.NewTicker(interval)
@@ -179,12 +237,31 @@ func (v *vehicle) run(ctx context.Context, endpoint, certDir string, interval ti
 		if err != nil {
 			return err
 		}
+		if wireJSON {
+			payload, err = json.Marshal(wireEnvelope{Payload: base64.StdEncoding.EncodeToString(payload)})
+			if err != nil {
+				return err
+			}
+		}
 		if !client.IsConnectionOpen() {
 			continue
 		}
-		client.Publish(topic, 1, false, payload).WaitTimeout(5 * time.Second)
+		publish(v.vin, client, payload)
 		if v.rng.Float64() < dupRate { // exercise the deduplication path
-			client.Publish(topic, 1, false, payload).WaitTimeout(5 * time.Second)
+			publish(v.vin, client, payload)
 		}
+	}
+}
+
+// wireEnvelope matches iot-kafka-bridge's decodePayload: a JSON object carrying the
+// original protobuf bytes, base64-encoded, under "payload".
+type wireEnvelope struct {
+	Payload string `json:"payload"`
+}
+
+func publish(vin string, client mqtt.Client, payload []byte) {
+	tok := client.Publish(topic, 1, false, payload)
+	if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+		slog.Warn("publish did not confirm", "vin", vin, "err", tok.Error())
 	}
 }

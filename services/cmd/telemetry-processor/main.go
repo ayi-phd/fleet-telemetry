@@ -41,8 +41,10 @@ func main() {
 
 	partitions := int32(platform.EnvInt("TOPIC_PARTITIONS", 6))
 	replication := int16(platform.EnvInt("TOPIC_REPLICATION", 3))
+	retention := platform.EnvDuration("TOPIC_RETENTION", 72*time.Hour)
+	minInsyncReplicas := platform.EnvInt("TOPIC_MIN_INSYNC_REPLICAS", 2)
 	if err := platform.Retry(ctx, "ensure topics", func(ctx context.Context) error {
-		return platform.EnsureTopics(ctx, cl, partitions, replication, rawTopic, canonicalTopic, dlqTopic)
+		return platform.EnsureTopics(ctx, cl, partitions, replication, retention, minInsyncReplicas, rawTopic, canonicalTopic, dlqTopic)
 	}); err != nil {
 		return
 	}

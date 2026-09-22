@@ -7,7 +7,7 @@ resource "kubernetes_deployment_v1" "web" {
     labels    = { app = "web" }
   }
   spec {
-    replicas = var.replicas.web
+    replicas = local.replicas.web
     selector {
       match_labels = { app = "web" }
     }
@@ -16,7 +16,21 @@ resource "kubernetes_deployment_v1" "web" {
         labels = { app = "web" }
       }
       spec {
-        node_selector = { workload = "core" }
+        # Preferred, not required: Floci's single k3s node carries no "workload" label.
+        affinity {
+          node_affinity {
+            preferred_during_scheduling_ignored_during_execution {
+              weight = 50
+              preference {
+                match_expressions {
+                  key      = "workload"
+                  operator = "In"
+                  values   = ["core"]
+                }
+              }
+            }
+          }
+        }
         security_context {
           run_as_non_root = true
           run_as_user     = 101
@@ -52,6 +66,9 @@ resource "kubernetes_deployment_v1" "web" {
             period_seconds = 10
           }
           security_context {
+            # See modules/service/main.tf: an omitted run_as_non_root here is
+            # serialized as an explicit false, overriding the pod-level true.
+            run_as_non_root            = true
             allow_privilege_escalation = false
             capabilities {
               drop = ["ALL"]
@@ -69,25 +86,27 @@ resource "kubernetes_service_v1" "web" {
   metadata {
     name      = "web"
     namespace = local.common.namespace
-    annotations = {
+    annotations = local.floci ? {} : {
       "service.beta.kubernetes.io/aws-load-balancer-type"                              = "nlb"
       "service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled" = "true"
     }
   }
   spec {
-    type     = "LoadBalancer"
+    # Floci's k3s has no in-tree NLB integration; deploy.sh prints a port-forward
+    # command instead of a URL for it.
+    type     = local.floci ? "NodePort" : "LoadBalancer"
     selector = { app = "web" }
     # The NLB preserves client IPs, so allow-listing happens on the node security group.
     # The in-tree NLB integration opens the NodePort to whatever this list says
     # (0.0.0.0/0 when empty), so it must mirror the infra allow-list exactly.
-    load_balancer_source_ranges = local.infra.dashboard_allowed_cidrs
+    load_balancer_source_ranges = local.floci ? null : local.infra.dashboard_allowed_cidrs
     port {
       name        = "http"
       port        = 80
       target_port = "http"
     }
   }
-  wait_for_load_balancer = true
+  wait_for_load_balancer = !local.floci
   timeouts {
     create = "15m"
   }

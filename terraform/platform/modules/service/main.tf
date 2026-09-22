@@ -41,12 +41,18 @@ variable "create_service_account" {
   type    = bool
   default = false
 }
+variable "service_account_annotations" {
+  description = "e.g. eks.amazonaws.com/role-arn for IRSA."
+  type        = map(string)
+  default     = {}
+}
 variable "node_selector" {
-  type    = map(string)
-  default = { workload = "core" }
+  description = "Node label to prefer scheduling onto (soft: a preferred node affinity, not a hard nodeSelector, so pods still schedule when no node carries the label - e.g. Floci's single unlabeled k3s node)."
+  type        = map(string)
+  default     = {}
 }
 variable "tolerations" {
-  type = list(object({ key = string, value = string, effect = string }))
+  type    = list(object({ key = string, value = string, effect = string }))
   default = []
 }
 variable "secret_volume" {
@@ -77,9 +83,10 @@ locals {
 resource "kubernetes_service_account_v1" "this" {
   count = var.create_service_account ? 1 : 0
   metadata {
-    name      = var.name
-    namespace = var.namespace
-    labels    = local.labels
+    name        = var.name
+    namespace   = var.namespace
+    labels      = local.labels
+    annotations = var.service_account_annotations
   }
 }
 
@@ -114,8 +121,28 @@ resource "kubernetes_deployment_v1" "this" {
 
       spec {
         service_account_name             = var.create_service_account ? kubernetes_service_account_v1.this[0].metadata[0].name : null
-        node_selector                    = var.node_selector
         termination_grace_period_seconds = var.termination_grace_seconds
+
+        dynamic "affinity" {
+          for_each = length(var.node_selector) > 0 ? [1] : []
+          content {
+            node_affinity {
+              preferred_during_scheduling_ignored_during_execution {
+                weight = 50
+                preference {
+                  dynamic "match_expressions" {
+                    for_each = var.node_selector
+                    content {
+                      key      = match_expressions.key
+                      operator = "In"
+                      values   = [match_expressions.value]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
 
         dynamic "toleration" {
           for_each = var.tolerations
@@ -237,6 +264,12 @@ resource "kubernetes_deployment_v1" "this" {
           }
 
           security_context {
+            # The Kubernetes provider serializes an omitted run_as_non_root in a
+            # container-level block as an explicit false, which overrides the pod-level
+            # true above and violates the namespace's "restricted" Pod Security
+            # Standard - confirmed on a live Floci run (PLAN.md Phase 4), and this
+            # would fail identically on real AWS.
+            run_as_non_root            = true
             allow_privilege_escalation = false
             read_only_root_filesystem  = true
             capabilities {

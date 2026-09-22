@@ -15,8 +15,9 @@ Everything runs on AWS and is created by one script and removed by another:
 
 ```mermaid
 flowchart LR
-  V[Vehicles<br/>protobuf over MQTT] -->|fleet/telemetry| IOT[AWS IoT Core<br/>topic rule]
-  IOT -->|raw-telemetry| K1[(MSK)]
+  V[Vehicles<br/>protobuf over MQTT] -->|fleet/telemetry| IOT[IoT Core<br/>topic rule]
+  IOT -->|invoke| LAM[iot-kafka-bridge<br/>Lambda]
+  LAM -->|raw-telemetry| K1[(MSK)]
   K1 --> TP[telemetry-processor]
   TP <-->|dedup + VIN→fleet| R[(ElastiCache Redis)]
   TP -->|canonical-events| K2[(MSK)]
@@ -32,9 +33,16 @@ flowchart LR
 1. **Vehicles** publish a `telemetry.v1.VehicleTelemetry` protobuf (`proto/telemetry/v1`) to
    `fleet/telemetry`. Each vehicle is an IoT thing with its own X.509 certificate; the IoT policy
    lets a device connect only under its own thing name and publish only to that topic.
-2. **IoT Core** forwards every message unchanged to Kafka topic `raw-telemetry` through a VPC
-   rule destination, keyed by client ID (the VIN) so each vehicle's reports stay in order.
-   It adds an `ingest_ts` header. Failed deliveries are logged to CloudWatch.
+2. **IoT Core** invokes the **iot-kafka-bridge** Lambda for every message (a topic rule with a
+   Lambda action; Floci's IoT rules can invoke Lambda but have no native Kafka action, so both
+   targets use the same path). The function reads only the VIN, then republishes the original
+   protobuf bytes to Kafka topic `raw-telemetry` unmodified, keyed by VIN so each vehicle's
+   reports stay in one partition, with an `ingest_ts` header set to the receive time. Failed
+   rule deliveries are logged to CloudWatch; exhausted async retries land in a dead-letter
+   queue. Two accepted trade-offs: the Kafka key no longer proves which device sent a message
+   (on AWS the IoT policy still binds each connection to its own thing), and async retries can
+   reorder a vehicle's reports, which telemetry-processor's deduplication and the dashboard's
+   newest-`deviceTimestamp`-per-VIN handling both tolerate.
 3. **telemetry-processor** decodes and validates each message, drops duplicates using Redis,
    looks up the vehicle's fleet in Redis, and publishes JSON to `canonical-events`.
    Invalid messages go to `raw-telemetry-dlq`. Vehicles with no fleet are tagged `UNASSIGNED`.
@@ -78,7 +86,7 @@ come and go.
 ```
 deploy.sh, destroy.sh     the only two scripts
 proto/                    protobuf contracts: telemetry, router gRPC stream, authz gRPC
-services/                 one Go module, five binaries (cmd/*), shared code in internal/
+services/                 one Go module, six binaries (cmd/*), shared code in internal/
   Dockerfile              builds any service: --build-arg SERVICE=<name>
 web/                      React + Leaflet dashboard, served by nginx
 terraform/infra/          stage 1: VPC, EKS, MSK, ElastiCache, RDS, OpenSearch, IoT Core, ECR, IAM
@@ -174,10 +182,67 @@ the account still use it.
 
 ## Cost
 
-With default sizes in us-west-2, on-demand pricing, the stack costs roughly **$0.90 per hour
-(about $650 per month)** before data transfer. The largest items are the EKS nodes
-(3 × t3.large, 2 × t3.medium), MSK (3 brokers), the EKS control plane, OpenSearch and
-ElastiCache. Run `./destroy.sh` when you're done.
+With default sizes in us-west-2, on-demand pricing, the stack costs roughly **$0.84 per hour
+(about $610 per month)** before data transfer. The largest items are the EKS nodes
+(3 × t4g.large, 2 × t4g.medium — Graviton, about 20% cheaper than the equivalent t3 sizes),
+MSK (3 brokers), the EKS control plane, OpenSearch and ElastiCache. Run `./destroy.sh` when
+you're done.
+
+## Running on Floci
+
+The same code and the same two scripts also run against [Floci](https://floci.io), a local
+AWS emulator, for development without any AWS cost. `deploy.sh` never starts Floci itself —
+it expects one already running and configured, and tells you exactly what's missing if not:
+
+```bash
+TARGET=floci ./deploy.sh
+```
+
+Required before running it: Floci itself, started with its real MQTT broker turned on and
+reachable from pods. The `floci` CLI (`floci start`) has no flag or profile field for either of
+those, so start the container directly instead:
+
+```bash
+docker run -d --name floci \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v floci-data:/app/data \
+  -p 4566:4566 -p 1883:1883 -p 8883:8883 \
+  -e FLOCI_SERVICES_IOT_MQTT_AUTO_START=true \
+  floci/floci:latest /app/application -Dquarkus.http.host=0.0.0.0
+```
+
+Without `FLOCI_SERVICES_IOT_MQTT_AUTO_START=true`, Floci's MQTT broker never starts: it
+listens on nothing, `vehicle-simulator`'s connections retry forever without ever surfacing an
+error (confirmed on a live run — PLAN.md Phase 4), and no telemetry ever reaches Kafka. Without
+the `-p 1883:1883 -p 8883:8883` mappings the broker has no port to listen on even once started.
+`deploy.sh` checks both (via `docker inspect floci`, since Floci exposes no API for this) and
+fails with this exact command if either is missing — it never starts or reconfigures Floci
+itself.
+
+Also required:
+
+- Floci reachable (default `http://localhost:4566`; override with `FLOCI_ENDPOINT`).
+- Docker Desktop with roughly 12 GB of memory available.
+
+What's different on Floci, all switched by the same `target` Terraform variable: one broker
+each for MSK, ElastiCache and OpenSearch, no NAT gateway, no EKS node groups (k3s runs every
+pod on its single node), plaintext Kafka and Redis, one replica per service, and the
+dashboard reachable by port-forward instead of a load balancer:
+
+```bash
+kubectl -n fleet port-forward svc/web 8080:80   # deploy.sh prints this exact command
+```
+
+Tear it down the same way, targeting the same Floci:
+
+```bash
+TARGET=floci ./destroy.sh   # Floci itself keeps running
+```
+
+A few pieces of this are best guesses until verified against a real Floci run (see PLAN.md
+Phase 4): OpenSearch's scheme/port, whether pods can resolve the addresses Floci hands back
+for MSK/RDS/ElastiCache/OpenSearch, and the ECR registry hostname's exact form. `deploy.sh`
+will fail with a clear error at whichever step needs a fallback if one of these doesn't hold.
 
 ## Local dashboard development
 
@@ -195,7 +260,7 @@ API_TARGET=http://<dashboard_url> npm run dev
 kubectl -n fleet get pods
 kubectl -n fleet logs -l app=telemetry-processor -f
 kubectl -n fleet logs -l app=realtime-router -f
-aws logs tail /aws/iot/fleet-telemetry/rule-errors --follow   # IoT → Kafka delivery failures
+aws logs tail /aws/iot/fleet-telemetry/rule-errors --follow   # IoT → Lambda invoke failures
 ```
 
 Every Go service serves `/healthz`, `/readyz` and Prometheus `/metrics` on port 8081

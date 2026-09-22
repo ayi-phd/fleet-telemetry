@@ -2,11 +2,12 @@
 # Build context: repository root. Usage:
 #   docker buildx build -f services/Dockerfile --build-arg SERVICE=telemetry-processor .
 # The build stage runs on the builder's native platform and cross-compiles, so an
-# arm64 laptop produces amd64 images for the EKS nodes without QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
+# amd64 builder still produces arm64 images (for the Graviton EKS nodes and the
+# Lambda) without QEMU emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 ARG SERVICE
 ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETARCH=arm64
 ENV GOTOOLCHAIN=auto CGO_ENABLED=0
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
  && rm -rf /var/lib/apt/lists/*
@@ -21,9 +22,17 @@ RUN protoc -I ../proto \
       --go-grpc_out=. --go-grpc_opt=module=github.com/example/fleet-telemetry \
       ../proto/telemetry/v1/telemetry.proto ../proto/router/v1/router.proto ../proto/authz/v1/authz.proto
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    go mod tidy && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
+    go mod download && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# Long-running Kubernetes services: --target runtime-standard
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime-standard
 COPY --from=build /out/app /app
 USER nonroot:nonroot
 ENTRYPOINT ["/app"]
+
+# iot-kafka-bridge, invoked by AWS IoT Core (or Floci's emulator): --target runtime-lambda.
+# The base image's WORKDIR is /var/task; aws-lambda-go talks to the Lambda Runtime API
+# itself, so no separate runtime interface client is needed.
+FROM public.ecr.aws/lambda/provided:al2023 AS runtime-lambda
+COPY --from=build /out/app ./app
+ENTRYPOINT ["./app"]

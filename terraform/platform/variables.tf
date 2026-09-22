@@ -4,6 +4,34 @@ variable "image_tag" {
   default     = "latest"
 }
 
+variable "target" {
+  description = "Deployment target: \"aws\" or \"floci\". Set by deploy.sh."
+  type        = string
+  default     = "aws"
+  validation {
+    condition     = contains(["aws", "floci"], var.target)
+    error_message = "target must be \"aws\" or \"floci\"."
+  }
+}
+
+variable "floci_deploy_access_key_id" {
+  description = "Floci-local IAM access key, used as static OpenSearch credentials for realtime-router and dashboard-api since Floci's EKS emulation has no OIDC identity for IRSA. Set by deploy.sh; unused on AWS."
+  type        = string
+  default     = ""
+}
+
+variable "floci_deploy_secret_access_key" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+
+variable "floci_extra_hosts" {
+  description = "Newline-separated \"ip name\" pairs for every floci-* container, discovered by deploy.sh. iot-kafka-bridge writes these into its own /etc/hosts at startup: its execution containers sit outside the k3s cluster (deploy.sh's node/CoreDNS patching doesn't reach them), yet Kafka's protocol advertises MSK's randomly-suffixed container name in metadata responses, so even an IP bootstrap address isn't enough for the follow-up produce request. Set by deploy.sh; unused on AWS."
+  type        = string
+  default     = ""
+}
+
 variable "simulator_enabled" {
   type    = bool
   default = true

@@ -7,8 +7,9 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  name = var.project
-  azs  = slice(data.aws_availability_zones.available.names, 0, 3)
+  name  = var.project
+  azs   = slice(data.aws_availability_zones.available.names, 0, 3)
+  floci = var.target == "floci"
 }
 
 module "vpc" {
@@ -22,7 +23,7 @@ module "vpc" {
   private_subnets = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, i)]      # /20 each
   public_subnets  = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 48)] # /24 each
 
-  enable_nat_gateway   = true
+  enable_nat_gateway   = !local.floci # Floci: CreateNatGateway is unsupported
   single_nat_gateway   = var.single_nat_gateway
   enable_dns_hostnames = true
   enable_dns_support   = true
@@ -97,20 +98,6 @@ resource "aws_security_group" "opensearch" {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-  }
-  lifecycle { create_before_destroy = true }
-}
-
-resource "aws_security_group" "iot_destination" {
-  name_prefix = "${local.name}-iot-"
-  description = "ENIs used by the IoT Core VPC rule destination to reach MSK"
-  vpc_id      = module.vpc.vpc_id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
     cidr_blocks = [var.vpc_cidr]
   }
   lifecycle { create_before_destroy = true }

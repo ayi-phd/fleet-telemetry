@@ -25,6 +25,16 @@ variable "single_nat_gateway" {
   default     = true
 }
 
+variable "target" {
+  description = "Deployment target: \"aws\" or \"floci\". Set by deploy.sh."
+  type        = string
+  default     = "aws"
+  validation {
+    condition     = contains(["aws", "floci"], var.target)
+    error_message = "target must be \"aws\" or \"floci\"."
+  }
+}
+
 variable "eks_version" {
   type    = string
   default = "1.34"
@@ -44,13 +54,13 @@ variable "dashboard_allowed_cidrs" {
 
 variable "core_node_instance_types" {
   type    = list(string)
-  default = ["t3.large"]
+  default = ["t4g.large"]
 }
 
 variable "edge_node_instance_types" {
   description = "Node group dedicated to dashboard-api (long-lived SSE connections)."
   type        = list(string)
-  default     = ["t3.medium"]
+  default     = ["t4g.medium"]
 }
 
 variable "msk_kafka_version" {
@@ -95,7 +105,13 @@ variable "create_opensearch_service_linked_role" {
 }
 
 variable "kubernetes_namespace" {
-  description = "Namespace the platform stack deploys into (used for Pod Identity associations)."
+  description = "Namespace the platform stack deploys into (used in IRSA trust policies)."
   type        = string
   default     = "fleet"
+}
+
+variable "iot_endpoint_override" {
+  description = "Overrides the iot_endpoint output. Floci: a pod-resolvable hostname for its IoT emulation, set by deploy.sh, since data.aws_iot_endpoint may not return one pods can reach. Empty uses the data source."
+  type        = string
+  default     = ""
 }
