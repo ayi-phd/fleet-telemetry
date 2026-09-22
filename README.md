@@ -239,10 +239,80 @@ Tear it down the same way, targeting the same Floci:
 TARGET=floci ./destroy.sh   # Floci itself keeps running
 ```
 
-A few pieces of this are best guesses until verified against a real Floci run (see PLAN.md
-Phase 4): OpenSearch's scheme/port, whether pods can resolve the addresses Floci hands back
-for MSK/RDS/ElastiCache/OpenSearch, and the ECR registry hostname's exact form. `deploy.sh`
-will fail with a clear error at whichever step needs a fallback if one of these doesn't hold.
+The full pipeline (simulator → IoT → Lambda → MSK → dashboard) has been verified working
+end to end on Floci, including permission filtering across two different users. Getting
+there took working around a long list of real Floci-side bugs and gaps, one at a time —
+see below.
+
+### Known Floci limitations and how we worked around them
+
+Everything here was found on a live Floci instance, not assumed; full details, exact
+evidence, and file references are in `PLAN.md`'s Phase 4.5.
+
+1. **No embedded DNS between Floci's own containers at all** — pods, and even the k3s
+   node's own image-pulling containerd, can't resolve any Floci-managed container (MSK,
+   RDS, OpenSearch, ElastiCache, the ECR registry) by name, only by IP. Fixed by having
+   `deploy.sh` discover every `floci-*` container's IP at deploy time and patch it into
+   both the k3s node's `/etc/hosts` and CoreDNS's `Corefile`.
+2. **ElastiCache's `primary_endpoint_address` returns the literal string `"localhost"`**,
+   which is useless from inside a pod. Fixed with a Floci-specific `redis_address`
+   override in Terraform, pointing at the real container-name hostname instead.
+3. **Floci's EKS emulation never populates an OIDC issuer, so IRSA can't work at all.**
+   Fixed by having `realtime-router` and `dashboard-api` use a static Floci-local IAM
+   user's access key as credentials instead, only on Floci.
+4. **`aws_iam_service_linked_role` for OpenSearch fails outright** with
+   `UnsupportedOperation`. Fixed by gating that resource to AWS-only.
+5. **Floci doesn't honor or report RDS storage encryption**, so declaring it caused an
+   endless drift-and-replace loop. Fixed by only setting `storage_encrypted = true` on
+   AWS.
+6. **The native OpenSearch domain resource never works on Floci**: its `Processing` flag
+   never clears, and a separate upstream `terraform-provider-aws` bug crashes on refresh
+   because Floci omits a field real AWS always sets. Fixed by creating and destroying the
+   domain via a `null_resource` that calls the AWS CLI directly and polls the real
+   container, bypassing the native resource on Floci entirely.
+7. **Floci's `Describe*` responses omit several fields that were set at creation time**
+   (EKS's `access_config`, ElastiCache's `engine`, MSK's `broker_node_group_info`/
+   `encryption_info`), so Terraform thinks they drifted and destroys/recreates them on
+   every single apply. Accepted as a deliberate trade-off rather than worked around: every
+   Floci deploy fully recreates the EKS cluster, MSK cluster, and ElastiCache replication
+   group from scratch (all data included), which is fine for a throwaway local target.
+8. **Floci's IoT certificate emulation is fundamentally broken** — it returns a
+   certificate's own ID wrapped in PEM armor instead of a real X.509 certificate, and
+   every alternative registration API hits the same bug or is misrouted entirely. Fixed by
+   having `vehicle-simulator` generate and use its own self-signed certificate on Floci,
+   skipping IoT Core certificate registration there entirely.
+9. **Floci's MQTT broker doesn't run at all by default** — only its control-plane API
+   (port 4566) is up, with no device-facing broker on 1883/8883. Fixed by starting Floci
+   with `FLOCI_SERVICES_IOT_MQTT_AUTO_START=true` and those ports published via a raw
+   `docker run` (the `floci` CLI itself has no way to express this setting).
+10. **Even with the broker running, its TLS/mutual-TLS listener on port 8883 never
+    completes a handshake**, with or without a client certificate. Fixed by having
+    `vehicle-simulator` fall back to plaintext MQTT on port 1883 on Floci only, while AWS
+    keeps real mutual TLS.
+11. **Floci's IoT rules engine silently corrupts any binary MQTT payload** by forcing it
+    through UTF-8 decoding before any rule SQL evaluates it, destroying protobuf data
+    beyond recovery. Fixed by having `vehicle-simulator` publish a UTF-8-safe base64-JSON
+    envelope on Floci only, which the Lambda already knew how to unwrap back into the
+    original, unmodified protobuf bytes.
+12. **The Lambda's own execution containers run outside the k3s cluster entirely**, so
+    they can't resolve Kafka's real (randomly-suffixed) broker hostname for the actual
+    produce call, even though the initial IP-based bootstrap connects fine. Fixed by
+    having the Lambda self-patch its own `/etc/hosts` at startup from a host list
+    Terraform supplies.
+13. **The bare `floci` gateway container itself was never covered by the dynamic
+    container-discovery pattern** used everywhere else, so the hostname
+    `vehicle-simulator` needs to reach the broker never resolved. Fixed by extending the
+    discovery loop to explicitly patch that one container too.
+14. **`delete-domain`/`DeleteDBInstance` tell Floci's control plane a resource is gone,
+    and Terraform reports a clean destroy, but the underlying Docker container for
+    OpenSearch (and RDS) keeps running regardless.** Fixed for OpenSearch, where the
+    destroy step now also force-removes its container directly; the equivalent RDS leak
+    is documented but not fixed.
+15. **Floci's OpenSearch `describe-domain` can keep reporting a domain as present after a
+    destroy** (its `delete-domain` call needed calling twice to fully take effect), which
+    fooled a later deploy's idempotency check into skipping domain creation entirely.
+    Fixed by having the create step check the real Docker container's running state
+    instead of trusting `describe-domain`.
 
 ## Local dashboard development
 
