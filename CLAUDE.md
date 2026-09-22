@@ -66,7 +66,7 @@ PostgreSQL holds vehicle↔fleet assignments and grants.
 
 | If you change… | …also change |
 |---|---|
-| `authz.SimVIN` (`SIM%014d`) in `services/internal/authz/store.go` | `format("SIM%014d", i)` in `terraform/platform/simulator.tf` |
+| `authz.SimVIN` (`7H4T9K2L5RA%06d`) in `services/internal/authz/store.go` | `format("7H4T9K2L5RA%06d", 102300+i)` in `terraform/platform/simulator.tf` |
 | `statusColor` in `web/src/format.ts` | `--s-*` colours in `web/src/styles.css` (Leaflet SVG can't read CSS variables) |
 | Any `Env("…")` key read in Go | the matching keys in Terraform (ConfigMap, secrets, Lambda environment) |
 | Go module path `github.com/example/fleet-telemetry` | `go_package` in all `.proto` files, `services/Makefile`, the `protoc` step in `services/Dockerfile` |
