@@ -162,19 +162,25 @@ resource "null_resource" "opensearch_floci" {
     command = <<-EOT
       set -euo pipefail
       name='${local.name}'
-      if ! aws opensearch describe-domain --domain-name "$name" >/dev/null 2>&1; then
+      container="floci-opensearch-$name"
+      # describe-domain is not a reliable signal for whether create-domain still needs
+      # to run: confirmed on a live run that it kept reporting the domain as present
+      # ("Deleted": false) well after a prior destroy had already removed the
+      # container, because Floci's own delete-domain call didn't take effect until
+      # called a second time - so the create step here skipped calling create-domain
+      # (describe-domain "succeeded"), and the container was simply never spawned, with
+      # nothing but a generic health-check timeout to show for it. Check the real
+      # container's state instead, the same way the health-check loop below already
+      # does. "Already exists" from create-domain is expected and tolerated: it can
+      # legitimately fire when Floci's own state disagrees with the container's.
+      if [ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
         aws opensearch create-domain \
           --domain-name "$name" \
           --engine-version '${var.opensearch_version}' \
           --cluster-config 'InstanceType=${var.opensearch_instance_type},InstanceCount=1,DedicatedMasterEnabled=false,ZoneAwarenessEnabled=false' \
           --ebs-options 'EBSEnabled=true,VolumeType=gp3,VolumeSize=20' \
-          >/dev/null
+          >/dev/null 2>&1 || true
       fi
-      # DescribeDomain.Processing never clears on Floci, so check the real container
-      # (reachable from the host running Terraform via `docker exec`, not by name -
-      # the container-name hostname only resolves between containers on Floci's
-      # network, which is what the pods use; see the opensearch_endpoint output).
-      container="floci-opensearch-$name"
       for i in $(seq 1 60); do
         docker exec "$container" curl -fsS http://localhost:9200 >/dev/null 2>&1 && exit 0
         sleep 2
