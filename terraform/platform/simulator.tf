@@ -1,7 +1,9 @@
 # Demo vehicles: one IoT thing + X.509 certificate per VIN. The VIN format must match
-# authz.SimVIN() in services/internal/authz/store.go (seeded into PostgreSQL).
+# authz.SimVIN() in services/internal/authz/store.go (seeded into PostgreSQL). Uses a
+# fixed 11-character prefix plus a 6-digit serial, so these look like real 17-character
+# vehicle VINs rather than an obviously synthetic "SIM...".
 locals {
-  sim_vins = var.simulator_enabled ? [for i in range(1, var.simulated_vehicle_count + 1) : format("SIM%014d", i)] : []
+  sim_vins = var.simulator_enabled ? [for i in range(1, var.simulated_vehicle_count + 1) : format("7H4T9K2L5RA%06d", 102300 + i)] : []
 }
 
 resource "aws_iot_thing" "sim" {
