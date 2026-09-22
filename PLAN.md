@@ -514,6 +514,22 @@ verified live via `/api/vehicles/latest` with two different demo user sessions:
       Floci-side leak (manual `docker rm` after a destroy, if it matters for local disk
       space). Floci's own persistent containers (`floci`, `floci-ecr-registry`) correctly
       survive `destroy.sh`, as designed.
+- [x] **A consequence of the above, found on a second deploy against the same
+      long-lived Floci instance (a user running the platform themselves, a session
+      after this one)**: `describe-domain` kept reporting the OpenSearch domain as
+      present (`"Deleted": false`) after a prior destroy, because that destroy's
+      `delete-domain` call apparently needed to be issued twice to fully take effect on
+      Floci's side (confirmed manually: a second `delete-domain` call flipped it to
+      `"Deleted": true` and `describe-domain` then correctly 404'd). The create
+      provisioner's own idempotency guard (`if ! describe-domain; then create-domain;
+      fi`) trusted that stale "present" answer, skipped calling `create-domain`
+      entirely, and the container was simply never spawned - the only symptom was the
+      health-check loop's generic timeout, no error pointing at the real cause. **Fixed**:
+      the guard now checks the real Docker container's running state instead of
+      trusting `describe-domain` (`docker inspect --format '{{.State.Running}}'`), matching
+      what the health-check loop below it already does; `create-domain`'s own
+      "already exists" error is now expected and tolerated (`|| true`) rather than relied
+      on to signal anything.
 
 ## Phase 5: verify on real AWS — **gated, needs separate human approval**
 
