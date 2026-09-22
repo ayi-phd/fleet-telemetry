@@ -189,5 +189,7 @@ func (s *Store) Seed(ctx context.Context, vehicleCount int, password string) err
 	return nil
 }
 
-// SimVIN must match the Terraform format("SIM%014d", i) used to create IoT things.
-func SimVIN(i int) string { return fmt.Sprintf("SIM%014d", i) }
+// SimVIN must match the Terraform format("7H4T9K2L5RA%06d", 102300+i) used to create
+// IoT things - a fixed 11-character prefix plus a 6-digit serial, so simulated VINs
+// look like real 17-character vehicle VINs instead of an obviously synthetic "SIM...".
+func SimVIN(i int) string { return fmt.Sprintf("7H4T9K2L5RA%06d", 102300+i) }

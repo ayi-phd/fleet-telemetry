@@ -17,3 +17,6 @@ terraform/platform/floci-ca.pem
 services/gen/
 web/node_modules/
 web/dist/
+
+# macOS Finder
+.DS_Store

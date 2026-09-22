@@ -53,6 +53,12 @@ export default function Dashboard({ me, onSignOut }: { me: Me; onSignOut: () => 
   return (
     <div className="shell">
       <aside className="rail">
+        <div className="brand">
+          <img className="brand-logo" src="/Harbinger-Logo.png" alt="Harbinger" />
+          <p className="brand-title">EV Fleet Intelligence POC</p>
+          <p className="brand-byline">Built by candidate: Andrei Istomin</p>
+        </div>
+
         <header className="rail-head">
           <div className="identity">
             <p className="identity-name">{me.name}</p>
