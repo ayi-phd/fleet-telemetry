@@ -11,7 +11,7 @@ Everything runs on AWS and is created by one script and removed by another:
 ./destroy.sh    # deletes everything
 ```
 
-## How a position report travels
+## Vehicle Telematics Processing Pipeline
 
 ```mermaid
 flowchart LR
