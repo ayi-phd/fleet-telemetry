@@ -120,6 +120,29 @@ $floci_setup_help"
   step "Setting up an IAM user for EKS auth (Floci rejects test/test for it)"
   floci_ensure_deploy_credentials
   info "Deploying as $FLOCI_DEPLOY_USER"
+
+  # terraform init's provider installer doesn't reliably skip the network even with a
+  # matching lock file and an already-extracted provider (confirmed on a live run: it
+  # still tried to reach registry.terraform.io and failed outright while offline). A
+  # filesystem mirror is the one Terraform-documented way to guarantee it never tries
+  # at all. Built once, while online; reused untouched after that no matter how long
+  # the machine stays offline. Not needed on AWS, where checking the real registry is
+  # the point.
+  FLOCI_MIRROR="$ROOT/.floci-provider-mirror"
+  if [[ ! -d "$FLOCI_MIRROR" ]]; then
+    step "Caching Terraform providers locally for offline Floci use (one-time, needs internet)"
+    terraform -chdir="$INFRA" providers mirror "$FLOCI_MIRROR" >/dev/null
+    terraform -chdir="$PLATFORM" providers mirror "$FLOCI_MIRROR" >/dev/null
+  fi
+  export TF_CLI_CONFIG_FILE="$ROOT/.floci.tfrc"
+  cat >"$TF_CLI_CONFIG_FILE" <<EOF
+provider_installation {
+  filesystem_mirror {
+    path    = "$FLOCI_MIRROR"
+    include = ["registry.terraform.io/*/*"]
+  }
+}
+EOF
 else
   AWS_REGION="${AWS_REGION:-us-west-2}"
   export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION"

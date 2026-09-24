@@ -224,6 +224,12 @@ Also required:
 - Floci reachable (default `http://localhost:4566`; override with `FLOCI_ENDPOINT`).
 - Docker Desktop with roughly 12 GB of memory available.
 
+The first `deploy.sh` run needs internet once, to build a local Terraform provider
+mirror (`.floci-provider-mirror/`, gitignored). Every `deploy.sh`/`destroy.sh` run after
+that works fully offline, however long the machine stays disconnected - confirmed on a
+live run that Terraform's provider installer doesn't reliably skip the network on its
+own, even with a matching lock file and an already-downloaded provider.
+
 What's different on Floci, all switched by the same `target` Terraform variable: one broker
 each for MSK, ElastiCache and OpenSearch, no NAT gateway, no EKS node groups (k3s runs every
 pod on its single node), plaintext Kafka and Redis, one replica per service, and the
