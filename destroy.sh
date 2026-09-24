@@ -32,8 +32,8 @@ for bin in terraform aws; do
   command -v "$bin" >/dev/null || die "'$bin' is not installed or not on PATH."
 done
 
-tf "$INFRA" init -input=false >/dev/null 2>&1 || die "terraform init failed in terraform/infra."
-tf "$PLATFORM" init -input=false >/dev/null 2>&1 || die "terraform init failed in terraform/platform."
+init_out="$(tf "$INFRA" init -input=false 2>&1)" || { printf '%s\n' "$init_out" >&2; die "terraform init failed in terraform/infra."; }
+init_out="$(tf "$PLATFORM" init -input=false 2>&1)" || { printf '%s\n' "$init_out" >&2; die "terraform init failed in terraform/platform."; }
 
 if ! has_state "$INFRA" && ! has_state "$PLATFORM"; then
   info "Nothing is deployed from this checkout. Nothing to destroy."
