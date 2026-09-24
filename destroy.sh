@@ -32,6 +32,29 @@ for bin in terraform aws; do
   command -v "$bin" >/dev/null || die "'$bin' is not installed or not on PATH."
 done
 
+# The authoritative target (read from state, below) isn't available until after init
+# succeeds - but init itself is exactly what needs to know whether to go offline-only on
+# Floci. Peek at deploy.sh's saved tfvars directly (no terraform command needed) instead.
+if [[ "$(sed -n 's/.*"target"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' "$INFRA/deploy.auto.tfvars.json" 2>/dev/null)" == "floci" ]]; then
+  # terraform init's provider installer doesn't reliably skip the network even with a
+  # matching lock file and an already-extracted provider (confirmed on a live run: it
+  # still tried to reach registry.terraform.io and failed outright while offline). A
+  # filesystem mirror is the one Terraform-documented way to guarantee it never tries
+  # at all. deploy.sh builds it on the first Floci run; reused untouched here.
+  FLOCI_MIRROR="$ROOT/.floci-provider-mirror"
+  if [[ -d "$FLOCI_MIRROR" ]]; then
+    export TF_CLI_CONFIG_FILE="$ROOT/.floci.tfrc"
+    cat >"$TF_CLI_CONFIG_FILE" <<EOF
+provider_installation {
+  filesystem_mirror {
+    path    = "$FLOCI_MIRROR"
+    include = ["registry.terraform.io/*/*"]
+  }
+}
+EOF
+  fi
+fi
+
 init_out="$(tf "$INFRA" init -input=false 2>&1)" || { printf '%s\n' "$init_out" >&2; die "terraform init failed in terraform/infra."; }
 init_out="$(tf "$PLATFORM" init -input=false 2>&1)" || { printf '%s\n' "$init_out" >&2; die "terraform init failed in terraform/platform."; }
 
