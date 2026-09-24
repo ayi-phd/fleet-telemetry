@@ -18,6 +18,7 @@ terraform/platform/floci-ca.pem
 
 # Build output
 .build-*.log
+.floci-*.Dockerfile
 services/gen/
 web/node_modules/
 web/dist/

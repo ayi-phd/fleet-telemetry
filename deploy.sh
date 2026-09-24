@@ -225,11 +225,22 @@ aws ecr get-login-password | docker login --username AWS --password-stdin "$REGI
 build() { # <repo name> <dockerfile> <context> [build args...]
   local repo="$1" file="$2" context="$3"; shift 3
   info "Building $repo"
+  # A "# syntax=" directive makes BuildKit pull an external frontend image from Docker
+  # Hub before it can even parse the Dockerfile - fine on AWS, but breaks a fully-offline
+  # Floci deploy (confirmed on a live run: the same DNS-resolution-failure signature as
+  # the earlier Terraform provider issue). Nothing here actually needs it - cache mounts
+  # have been supported by Docker's own built-in default frontend for years - so strip
+  # it for Floci builds only; AWS builds keep the explicit pin unchanged.
+  if [[ "$TARGET" == "floci" ]]; then
+    local floci_file="$ROOT/.floci-$repo.Dockerfile"
+    sed '/^# syntax=/d' "$file" >"$floci_file"
+    file="$floci_file"
+  fi
   docker buildx build --platform linux/arm64 --provenance=false --push \
     -f "$file" -t "$REGISTRY/$PROJECT/$repo:$IMAGE_TAG" "$@" "$context" \
     >"$ROOT/.build-$repo.log" 2>&1 \
     || { tail -n 40 "$ROOT/.build-$repo.log" >&2; die "Image build for $repo failed (full log: .build-$repo.log)."; }
-  rm -f "$ROOT/.build-$repo.log"
+  rm -f "$ROOT/.build-$repo.log" "$ROOT/.floci-$repo.Dockerfile"
 }
 for svc in "${SERVICES[@]}"; do
   build "$svc" "$ROOT/services/Dockerfile" "$ROOT" --target runtime-standard --build-arg "SERVICE=$svc"
