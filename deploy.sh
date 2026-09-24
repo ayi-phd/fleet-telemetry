@@ -39,6 +39,13 @@ PROJECT="${PROJECT:-fleet-telemetry}"
 # deploy here with no other reason to need the network at all).
 INIT_UPGRADE_FLAG=""
 [[ "$TARGET" == "aws" ]] && INIT_UPGRADE_FLAG="-upgrade"
+# docker buildx build checks the registry for a mutable base-image tag's latest digest
+# by default, even when a matching image is already cached locally - real work only on
+# AWS (catching a genuinely updated/security-patched base image), pure liability on
+# Floci (confirmed on a live run: it failed outright while offline, on both base images,
+# despite them already being in BuildKit's local cache from an earlier build).
+BUILD_PULL_FLAG="--pull"
+[[ "$TARGET" == "floci" ]] && BUILD_PULL_FLAG="--pull=false"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -236,7 +243,7 @@ build() { # <repo name> <dockerfile> <context> [build args...]
     sed '/^# syntax=/d' "$file" >"$floci_file"
     file="$floci_file"
   fi
-  docker buildx build --platform linux/arm64 --provenance=false --push \
+  docker buildx build --platform linux/arm64 --provenance=false --push $BUILD_PULL_FLAG \
     -f "$file" -t "$REGISTRY/$PROJECT/$repo:$IMAGE_TAG" "$@" "$context" \
     >"$ROOT/.build-$repo.log" 2>&1 \
     || { tail -n 40 "$ROOT/.build-$repo.log" >&2; die "Image build for $repo failed (full log: .build-$repo.log)."; }
