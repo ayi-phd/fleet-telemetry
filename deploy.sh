@@ -309,6 +309,36 @@ if [[ "$TARGET" == "floci" ]]; then
   # re-deploys always recreate the EKS cluster; see PLAN.md's accepted Option (c)),
   # so this runs, and re-patches both places below, on every deploy.
   node_container="floci-eks-$PROJECT"
+
+  # k3s's own system pods (CoreDNS, metrics-server, the local-path provisioner) and the
+  # "pause" sandbox container every single pod needs all come from Docker Hub, not our
+  # ECR - and since the node container above is recreated fresh on every apply, their
+  # cache is wiped right along with it, needing a fresh pull on every single deploy.
+  # Confirmed on a live run: this is exactly what stalled rbac-authz's pod for 10+
+  # minutes offline (repeated "FailedCreatePodSandBox" retries for the pause image)
+  # until Kubernetes' own rollout deadline gave up first. Pull each one once into the
+  # host's persistent image store, then import them straight into the fresh node
+  # container's containerd store on every deploy - the host-side cache survives the
+  # node container being recreated, even though the node's own cache doesn't.
+  K3S_SYSTEM_IMAGES=(
+    rancher/mirrored-pause:3.6
+    rancher/mirrored-coredns-coredns:1.12.3
+    rancher/mirrored-metrics-server:v0.8.0
+    rancher/local-path-provisioner:v0.0.32
+  )
+  K3S_IMAGE_TAR="$ROOT/.floci-k3s-images.tar"
+  if [[ ! -f "$K3S_IMAGE_TAR" ]]; then
+    for img in "${K3S_SYSTEM_IMAGES[@]}"; do
+      docker image inspect "$img" >/dev/null 2>&1 || docker pull --platform linux/arm64 "$img" >/dev/null
+    done
+    docker save "${K3S_SYSTEM_IMAGES[@]}" -o "$K3S_IMAGE_TAR"
+  fi
+  if docker inspect "$node_container" >/dev/null 2>&1; then
+    docker cp "$K3S_IMAGE_TAR" "$node_container:/tmp/k3s-images.tar"
+    docker exec "$node_container" ctr -n k8s.io images import /tmp/k3s-images.tar >/dev/null
+    docker exec "$node_container" rm -f /tmp/k3s-images.tar
+  fi
+
   floci_hosts="" # newline-separated "ip name" pairs, no indentation (added by consumers)
   add_floci_host() {
     local cname="$1" hostname="$2"
