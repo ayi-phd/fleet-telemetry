@@ -31,6 +31,14 @@ LAMBDA_SERVICES=(iot-kafka-bridge) # built with --target runtime-lambda; not a K
 
 TARGET="${TARGET:-aws}"
 PROJECT="${PROJECT:-fleet-telemetry}"
+# -upgrade makes `terraform init` re-check the module registry over the network on every
+# run, even when an already-cached copy satisfies the version constraint - real work only
+# on AWS (catching a genuinely newer module version), pure liability on Floci (a local,
+# no-AWS-cost target that should be able to redeploy without internet once modules are
+# already cached; confirmed on a live run that a temporary internet outage broke a Floci
+# deploy here with no other reason to need the network at all).
+INIT_UPGRADE_FLAG=""
+[[ "$TARGET" == "aws" ]] && INIT_UPGRADE_FLAG="-upgrade"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -112,6 +120,29 @@ $floci_setup_help"
   step "Setting up an IAM user for EKS auth (Floci rejects test/test for it)"
   floci_ensure_deploy_credentials
   info "Deploying as $FLOCI_DEPLOY_USER"
+
+  # terraform init's provider installer doesn't reliably skip the network even with a
+  # matching lock file and an already-extracted provider (confirmed on a live run: it
+  # still tried to reach registry.terraform.io and failed outright while offline). A
+  # filesystem mirror is the one Terraform-documented way to guarantee it never tries
+  # at all. Built once, while online; reused untouched after that no matter how long
+  # the machine stays offline. Not needed on AWS, where checking the real registry is
+  # the point.
+  FLOCI_MIRROR="$ROOT/.floci-provider-mirror"
+  if [[ ! -d "$FLOCI_MIRROR" ]]; then
+    step "Caching Terraform providers locally for offline Floci use (one-time, needs internet)"
+    terraform -chdir="$INFRA" providers mirror "$FLOCI_MIRROR" >/dev/null
+    terraform -chdir="$PLATFORM" providers mirror "$FLOCI_MIRROR" >/dev/null
+  fi
+  export TF_CLI_CONFIG_FILE="$ROOT/.floci.tfrc"
+  cat >"$TF_CLI_CONFIG_FILE" <<EOF
+provider_installation {
+  filesystem_mirror {
+    path    = "$FLOCI_MIRROR"
+    include = ["registry.terraform.io/*/*"]
+  }
+}
+EOF
 else
   AWS_REGION="${AWS_REGION:-us-west-2}"
   export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION"
@@ -126,7 +157,7 @@ fi
 # --------------------------------------------------------------------------
 step "Stage 1/4: AWS infrastructure (VPC, EKS, MSK, ElastiCache, RDS, OpenSearch, IoT Core)"
 [[ "$TARGET" == "aws" ]] && info "A first run takes 40-60 minutes, mostly MSK and OpenSearch provisioning."
-tf "$INFRA" init -input=false -upgrade >/dev/null
+tf "$INFRA" init -input=false $INIT_UPGRADE_FLAG >/dev/null
 INFRA_STATE="$(tf "$INFRA" state list 2>/dev/null || true)"
 
 # Refuse to silently move an existing deployment to another region or target.
@@ -336,7 +367,7 @@ cat > "$PLATFORM/deploy.auto.tfvars.json" <<EOF
   "target": "$TARGET"$floci_creds_json
 }
 EOF
-tf "$PLATFORM" init -input=false -upgrade >/dev/null
+tf "$PLATFORM" init -input=false $INIT_UPGRADE_FLAG >/dev/null
 tf "$PLATFORM" apply -input=false -auto-approve
 
 # --------------------------------------------------------------------------

@@ -161,15 +161,12 @@ input {
 }
 
 .brand {
+  /* Half of the removed logo's 40px footprint (32px height + 8px margin-bottom),
+     so the content below moves up by 50% of that height rather than collapsing
+     all the way to the top. */
+  padding-top: 20px;
   padding-bottom: 14px;
   border-bottom: 1px solid var(--line);
-}
-
-.brand-logo {
-  display: block;
-  max-height: 32px;
-  width: auto;
-  margin-bottom: 8px;
 }
 
 .brand-title {

@@ -11,6 +11,10 @@ deploy.auto.tfvars.json
 terraform/platform/floci-ca.pem
 # A Floci-local IAM access key, meaningless outside that Floci instance
 .floci-deploy-key
+# Local Terraform provider mirror for fully-offline Floci deploys/destroys, and the
+# CLI config pointing at it; built by deploy.sh on first use, machine-specific
+.floci-provider-mirror/
+.floci.tfrc
 
 # Build output
 .build-*.log
