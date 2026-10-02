@@ -219,6 +219,25 @@ NAMESPACE="$(tf "$INFRA" output -raw kubernetes_namespace)"
 
 # --------------------------------------------------------------------------
 step "Stage 2/4: Building and pushing container images"
+if [[ "$TARGET" == "floci" ]]; then
+  # docker buildx build's own cache for a mutable base-image tag isn't reliably
+  # persistent even with --pull=false: confirmed on a live run that it still failed
+  # outright while offline a week after building successfully, because BuildKit's
+  # build cache (unlike a plain `docker pull`) is explicitly reclaimable and had
+  # evicted it in the meantime. Pull each base image once into Docker's regular,
+  # non-reclaimed image store instead - keep this list in sync with the FROM lines in
+  # services/Dockerfile and web/Dockerfile.
+  for base_image in \
+    golang:1.26-bookworm \
+    gcr.io/distroless/static-debian12:nonroot \
+    public.ecr.aws/lambda/provided:al2023 \
+    node:22-alpine \
+    nginxinc/nginx-unprivileged:1.27-alpine
+  do
+    docker image inspect "$base_image" >/dev/null 2>&1 \
+      || docker pull --platform linux/arm64 "$base_image" >/dev/null
+  done
+fi
 if [[ -z "${IMAGE_TAG:-}" ]]; then
   sha="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo build)"
   IMAGE_TAG="${sha}-$(date -u +%Y%m%d%H%M%S)"
