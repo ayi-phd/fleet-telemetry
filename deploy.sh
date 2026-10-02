@@ -238,7 +238,19 @@ if [[ "$TARGET" == "floci" ]]; then
     mkdir -p "$K3S_IMAGE_DIR"
     for img in "${K3S_SYSTEM_IMAGES[@]}"; do
       tarfile="$K3S_IMAGE_DIR/$(tr '/:' '__' <<<"$img").tar"
-      printf 'FROM %s\n' "$img" | docker buildx build --platform linux/arm64 -f - -o type=docker,dest="$tarfile" "$ROOT" >/dev/null
+      # -t matters here, not just for readability: without it the exported tar's
+      # manifest has RepoTags:null, so `ctr images import` on the node can only
+      # register the image by digest, never by the tag k3s's own containerd
+      # config requests for the sandbox/system images - meaning the import
+      # silently never satisfies that lookup, and every pod needing it falls
+      # through to a live registry pull regardless. Confirmed on a live run:
+      # removing the imported tag reference and re-importing from the
+      # untagged tar left only the digest reference, and `ctr run` against the
+      # tag then failed with "not found" - this is what was actually causing
+      # every offline rbac-authz/CoreDNS stall this whole saga, not a timing
+      # race; it only ever appeared to work because the network came back
+      # before kubelet gave up.
+      printf 'FROM %s\n' "$img" | docker buildx build --platform linux/arm64 -t "$img" -f - -o type=docker,dest="$tarfile" "$ROOT" >/dev/null
     done
   fi
   k3s_image_dir_json=",
