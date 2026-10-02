@@ -18,7 +18,7 @@ terraform/platform/floci-ca.pem
 # k3s's own system images (pause, CoreDNS, metrics-server, local-path-provisioner),
 # re-imported into the Floci EKS node container on every deploy since it's recreated
 # fresh each time; built by deploy.sh on first use, machine-specific
-.floci-k3s-images.tar
+.floci-k3s-images/
 
 # Build output
 .build-*.log

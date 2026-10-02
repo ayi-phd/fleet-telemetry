@@ -326,17 +326,28 @@ if [[ "$TARGET" == "floci" ]]; then
     rancher/mirrored-metrics-server:v0.8.0
     rancher/local-path-provisioner:v0.0.32
   )
-  K3S_IMAGE_TAR="$ROOT/.floci-k3s-images.tar"
-  if [[ ! -f "$K3S_IMAGE_TAR" ]]; then
+  # `docker save` on these specific manifest-list images produces a tarball missing a
+  # referenced layer blob (confirmed directly: rancher/mirrored-metrics-server:v0.8.0
+  # alone, saved alone, still comes out short one blob its own legacy manifest.json
+  # lists as required - a Docker Desktop/containerd-image-store bug, not anything
+  # about how we invoke it), which only surfaces later as a cryptic "content digest
+  # ... not found" when containerd actually extracts the layer. `docker buildx build`'s
+  # own image export (-o type=docker) resolves and bundles the same image correctly -
+  # confirmed by forcing real layer extraction (`ctr run`) afterward for every image.
+  K3S_IMAGE_DIR="$ROOT/.floci-k3s-images"
+  if [[ ! -d "$K3S_IMAGE_DIR" ]]; then
+    mkdir -p "$K3S_IMAGE_DIR"
     for img in "${K3S_SYSTEM_IMAGES[@]}"; do
-      docker image inspect "$img" >/dev/null 2>&1 || docker pull --platform linux/arm64 "$img" >/dev/null
+      tarfile="$K3S_IMAGE_DIR/$(tr '/:' '__' <<<"$img").tar"
+      printf 'FROM %s\n' "$img" | docker buildx build --platform linux/arm64 -f - -o type=docker,dest="$tarfile" "$ROOT" >/dev/null
     done
-    docker save "${K3S_SYSTEM_IMAGES[@]}" -o "$K3S_IMAGE_TAR"
   fi
   if docker inspect "$node_container" >/dev/null 2>&1; then
-    docker cp "$K3S_IMAGE_TAR" "$node_container:/tmp/k3s-images.tar"
-    docker exec "$node_container" ctr -n k8s.io images import /tmp/k3s-images.tar >/dev/null
-    docker exec "$node_container" rm -f /tmp/k3s-images.tar
+    for tarfile in "$K3S_IMAGE_DIR"/*.tar; do
+      docker cp "$tarfile" "$node_container:/tmp/k3s-image.tar"
+      docker exec "$node_container" ctr -n k8s.io images import /tmp/k3s-image.tar >/dev/null
+      docker exec "$node_container" rm -f /tmp/k3s-image.tar
+    done
   fi
 
   floci_hosts="" # newline-separated "ip name" pairs, no indentation (added by consumers)
