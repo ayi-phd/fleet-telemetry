@@ -563,6 +563,101 @@ Costs roughly $0.90/hour. Do not start without asking at that point.
       keeps admin reassignments.
 - [ ] Web (Vitest): stream merge keeps newest `deviceTimestamp` per VIN; `format.ts` helpers.
 
+## Phase 7: raw-stream switch — MSK or Kinesis, Lambda only on Floci (Decided)
+
+Why: swap the first hop (IoT Core → raw stream) between MSK and Kinesis via a `STREAM_RAW`
+switch, and remove the iot-kafka-bridge Lambda from the AWS path entirely, for both stream
+types. Floci's IoT rule engine runs native rule actions but never evaluates IoT SQL substitution
+templates (confirmed live against a real Floci instance: a rule with
+`partitionKey: "${clientid()}"` delivered the literal, unevaluated string to Kinesis, not the
+MQTT client ID — same result for `${topic()}`), so Floci still needs the Lambda to get the VIN
+as a key by decoding the protobuf itself. Real AWS's rules engine does evaluate substitution
+templates, so it doesn't need the Lambda for either stream type.
+
+**Design decisions (all made during planning; implement as written):**
+- `ingest_ts` on the `kinesis` path is dropped entirely in favor of the record's own
+  `ApproximateArrivalTimestamp`, uniformly regardless of which producer (Lambda on Floci, native
+  action on AWS) wrote it — keeps telemetry-processor's Kinesis-consumer code target-agnostic.
+  The `msk` path keeps a real `ingest_ts` header on both targets (Lambda-set on Floci,
+  `${timestamp()}`-set by the native rule on AWS).
+- The Kinesis stream is a real Terraform resource (`aws_kinesis_stream`), unlike `raw-telemetry`
+  the Kafka topic (which stays app-created via `EnsureTopics`) — intentional asymmetry: a
+  Kinesis stream is squarely "an AWS resource" under this file's "every AWS resource in
+  Terraform" rule in a way a Kafka topic isn't.
+- Shard checkpointing lives in Redis (already a dependency, already used for dedup), storing
+  per-shard sequence numbers, checkpointed after produce+dedup succeed — same ordering as the
+  existing "produce → dedup → commit" invariant, different store. Live resharding (shard
+  splits/merges) is a known, accepted gap, not handled in this phase.
+- Default `STREAM_RAW=msk` when unset — today's behavior is unchanged unless opted into.
+- AWS-side validation of this phase (actually exercising the native `kafka`/`kinesis` rule
+  actions, the VPC destination, IRSA for telemetry-processor) is gated the same way as Phase 5:
+  needs its own separate human approval before spending money. Everything here has been verified
+  against a live Floci instance and against AWS's own published documentation, not against a
+  real AWS account.
+
+- [ ] **`deploy.sh`/`destroy.sh`**: parse `STREAM_RAW` (`msk`|`kinesis`, default `msk`), write it
+      into `terraform/infra/deploy.auto.tfvars.json`. No other changes needed — the Lambda build
+      step stays unconditional (harmless on AWS, where it's simply never referenced).
+- [ ] **`terraform/infra/variables.tf`**: `stream_raw` (validated), `raw_stream_shards` (default
+      6, forced to 1 on Floci).
+- [ ] **New `terraform/infra/kinesis.tf`**: `aws_kinesis_stream.raw_telemetry`,
+      `count = var.stream_raw == "kinesis" ? 1 : 0`. Confirmed live against Floci: `create-stream`
+      /`put-record`/`get-shard-iterator`/`get-records`/`delete-stream` all round-trip correctly,
+      so this needs no Floci-specific branching.
+- [ ] **`terraform/infra/iam_pods.tf`**: add `"telemetry-processor"` to the IRSA `for_each`
+      (AWS + `stream_raw=="kinesis"` only — it has no IRSA/service account at all today); new
+      policy granting `kinesis:GetRecords`/`GetShardIterator`/`ListShards`/`DescribeStream*`
+      scoped to the stream ARN.
+- [ ] **New IAM (AWS only)**: a role for `iot.amazonaws.com` → `kinesis:PutRecord` (native
+      `kinesis` action, `stream_raw=="kinesis"` only); separately, for `stream_raw=="msk"`, a VPC
+      destination (`aws_iot_topic_rule_destination`) + a role for
+      `ec2:CreateNetworkInterface`/`DescribeNetworkInterfaces`/etc. (confirmed no manual
+      confirmation step is needed - status auto-transitions `IN_PROGRESS` → `ENABLED` within
+      minutes, unlike HTTP destinations) + a dedicated security group + a role granting
+      `secretsmanager:GetSecretValue`/`DescribeSecret` on the existing MSK SASL/SCRAM secret
+      (reused, not duplicated).
+- [ ] **`terraform/platform/iot.tf`**: rename `aws_iot_topic_rule.telemetry_to_lambda` (no longer
+      accurate); its action becomes `lambda` when `local.floci` (either stream type), else a
+      native action — `kafka` (`key="${clientid()}"`, `headers=[{ingest_ts: "${timestamp()}"}]`,
+      `clientProperties` with `security.protocol=SASL_SSL`/`sasl.mechanism=SCRAM-SHA-512` via
+      `get_secret()`) when `stream_raw=="msk"`, `kinesis` (`partitionKey="${clientid()}"`) when
+      `stream_raw=="kinesis"`.
+- [ ] **`terraform/platform/lambda.tf`**: whole resource becomes `count = local.floci ? 1 : 0`
+      (today it exists on both targets); gains a `STREAM_RAW` env var so its own code picks a
+      producer implementation.
+- [ ] **`terraform/platform/main.tf`**: split the shared `kafka_secrets` local — raw-side and
+      canonical-side currently share the exact same secret keys, which stops being correct once
+      the raw side can be a different transport; add `create_service_account` + IRSA annotations
+      to `module.telemetry_processor` (AWS+kinesis); add a Floci static-creds env block
+      (mirroring the existing `opensearch_secret_env` pattern) for telemetry-processor and the
+      Lambda when `local.floci && stream_raw=="kinesis"`.
+- [ ] **`destroy.sh`**: retarget the existing slow-ENI-teardown wait from the Lambda (which was
+      always AWS-only — Floci's Lambda has never been VPC-attached) to the new VPC destination,
+      conditioned on `!local.floci && stream_raw=="msk"`; skip the wait entirely for
+      `stream_raw=="kinesis"` (no VPC entities in that path at all). The VPC destination's ENIs
+      are expected to be similarly slow to release (same underlying EC2 mechanism as the
+      Lambda's) but this is unconfirmed until exercised on real AWS.
+- [ ] **`services/internal/platform/kinesis.go`** (new): thin AWS SDK v2 Kinesis client wrapper
+      (needs the `service/kinesis` submodule added to `go.mod`; `aws-sdk-go-v2`/`config` are
+      already dependencies).
+- [ ] **`services/internal/platform/kafka.go`**: `EnsureTopics` skips creating `raw-telemetry`
+      when `STREAM_RAW=kinesis` (canonical-events/DLQ topic creation is unaffected).
+- [ ] **`services/cmd/iot-kafka-bridge/`**: extract a `RawProducer` interface; today's `kgo`
+      logic becomes `producer_kafka.go`; new `producer_kinesis.go` writes the VIN as the
+      partition key with no header at all (simpler than the Kafka path — relies entirely on
+      `ApproximateArrivalTimestamp` downstream). `main.go` picks an implementation via
+      `STREAM_RAW`. This binary only runs on Floci after this phase.
+- [ ] **`services/cmd/telemetry-processor/` + `internal/processor/processor.go`**: extract a
+      `RawConsumer` interface (`Poll`/`Checkpoint`); today's `kgo` consume/offset-commit logic
+      becomes one implementation; new Kinesis implementation does `ListShards`/
+      `GetShardIterator`/`GetRecords` polling, checkpointing per-shard sequence numbers in Redis
+      after produce+dedup succeed. The core produce→dedup→checkpoint loop in `processor.go` is
+      untouched — it calls through the interface either way, and doesn't care whether a Lambda
+      or a native rule action produced the record it's reading.
+- [x] **`CLAUDE.md`**: architecture section rewritten to describe the switch and the
+      Floci-only Lambda.
+- [ ] **`README.md`**: document the `STREAM_RAW` flag.
+
 ---
 
 ## Reference: AWS trade-offs of this plan

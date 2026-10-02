@@ -15,8 +15,8 @@ check PLAN.md before "fixing" it back.
 
 ## Architecture (specified by the user)
 
-protobuf over MQTT → IoT Core (`fleet/telemetry`) → IoT rule → iot-kafka-bridge Lambda →
-MSK `raw-telemetry` → telemetry-processor (Redis dedup + VIN→fleet) → `canonical-events` →
+protobuf over MQTT → IoT Core (`fleet/telemetry`) → IoT rule → raw stream (MSK or Kinesis,
+picked by `STREAM_RAW`) → telemetry-processor (Redis dedup + VIN→fleet) → `canonical-events` →
 realtime-router → gRPC streams opened by dashboard-api → SSE to the React dashboard.
 realtime-router also writes to OpenSearch. rbac-authz owns users and permissions.
 PostgreSQL holds vehicle↔fleet assignments and grants.
@@ -24,12 +24,26 @@ PostgreSQL holds vehicle↔fleet assignments and grants.
 - **Core goal:** an event reaches only dashboard-api pods that have a connected user allowed to
   see that vehicle or fleet, and only those users.
 - **IoT Core** is the device entry point on every target.
-- **MSK** is the Kafka service on every target. Terraform creates `aws_msk_cluster`; on Floci
-  it's emulated. Don't mention Floci's internal broker (Redpanda) except where its behaviour
+- **The raw stream is a switch: `STREAM_RAW={msk,kinesis}`, default `msk`.** MSK is the Kafka
+  service on every target (Terraform creates `aws_msk_cluster`; Floci emulates it). Kinesis is a
+  real `aws_kinesis_stream` on every target too (Floci emulates its data-plane API). Only this
+  first hop switches - telemetry-processor's own output (`canonical-events`) always stays on
+  MSK/Kafka. Don't mention Floci's internal Kafka broker (Redpanda) except where its behaviour
   differs from MSK.
-- **The Lambda sits between IoT Core and MSK on every target.** The Kafka record value is the
-  **original protobuf bytes, unmodified**; the key is the VIN decoded from the payload; the
-  Lambda sets the `ingest_ts` header. Never convert to JSON before telemetry-processor.
+- **The iot-kafka-bridge Lambda exists on Floci only.** Floci's IoT rule engine runs native rule
+  actions but never evaluates IoT SQL substitution templates (confirmed live: `${clientid()}`
+  and `${topic()}` both arrive as the literal, unevaluated string), so it can't get the VIN as a
+  key without a Lambda decoding the protobuf itself. On AWS, IoT Core writes directly into the
+  raw stream with no Lambda: a native `kafka` rule action (behind a VPC destination, SASL/SCRAM
+  via the same Secrets Manager secret MSK already uses) when `STREAM_RAW=msk`, or a native
+  `kinesis` rule action when `STREAM_RAW=kinesis` - both keyed on `${clientid()}` (the simulator
+  sets its MQTT client ID to the VIN).
+- The record value is always the **original protobuf bytes, unmodified**; the key is the VIN.
+  On the `msk` path, an `ingest_ts` header is set too - by the Lambda on Floci, by the rule's own
+  `${timestamp()}` on AWS - telemetry-processor reads it without caring which one set it. The
+  `kinesis` path has no header equivalent; telemetry-processor uses the record's own
+  `ApproximateArrivalTimestamp` instead. Never convert the payload to JSON before
+  telemetry-processor.
 
 ## Infrastructure rules
 
@@ -58,7 +72,8 @@ PostgreSQL holds vehicle↔fleet assignments and grants.
 - **telemetry-processor is at-least-once, never lossy**: produce → set dedup keys → commit
   offsets, in that order.
 - **Idempotent storage**: `eventId = VIN-deviceTimestamp` is the OpenSearch `_id`.
-- **`raw-telemetry` is keyed by VIN** so a vehicle's reports stay in one partition.
+- **The raw stream is keyed by VIN** (Kafka key or Kinesis partition key) so a vehicle's reports
+  stay in one partition/shard.
 - **Auth is an HttpOnly cookie** (`EventSource` can't send headers). `COOKIE_SECURE` stays
   false while the dashboard is served over plain HTTP; set it true once TLS exists.
 
