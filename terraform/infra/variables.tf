@@ -115,3 +115,9 @@ variable "iot_endpoint_override" {
   type        = string
   default     = ""
 }
+
+variable "floci_k3s_image_dir" {
+  description = "Absolute path to deploy.sh's pre-built tarballs of k3s's own system images (pause, CoreDNS, metrics-server, local-path-provisioner), set by deploy.sh before this stack's apply. Unused on AWS."
+  type        = string
+  default     = ""
+}

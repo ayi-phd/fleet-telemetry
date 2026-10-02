@@ -202,31 +202,22 @@ fi
 iot_endpoint_json=""
 [[ "$TARGET" == "floci" ]] && iot_endpoint_json=",
   \"iot_endpoint_override\": \"$FLOCI_IOT_ENDPOINT\""
-cat > "$INFRA/deploy.auto.tfvars.json" <<EOF
-{
-  "region": "$AWS_REGION",
-  "project": "$PROJECT",
-  "target": "$TARGET",
-  "create_opensearch_service_linked_role": $create_slr$allowed_json$iot_endpoint_json
-}
-EOF
-
-tf "$INFRA" apply -input=false -auto-approve
-
+k3s_image_dir_json=""
 if [[ "$TARGET" == "floci" ]]; then
   # k3s auto-schedules its own system pods (CoreDNS, metrics-server, the local-path
-  # provisioner) the moment the cluster above becomes active - and every single pod,
-  # including those, needs the "pause" sandbox image first. All of these come from
-  # Docker Hub, not our ECR, and the node container is recreated fresh on every apply
-  # (Floci re-deploys always recreate the EKS cluster; see PLAN.md's accepted Option
-  # (c)), wiping their cache right along with it. Confirmed on a live run: importing
-  # these right here, before Stage 2's image builds even start, is not just cleanup -
-  # running this later (originally placed in Stage 3, right before the DNS patch below)
-  # left a multi-minute gap after the cluster activates during which those system pods
-  # had already failed several pull attempts and backed off, so by the time the images
-  # became available they were stuck waiting out an existing backoff timer rather than
-  # retrying immediately - which is what actually stalled rbac-authz for 10+ minutes
-  # offline until Kubernetes' own rollout deadline gave up first.
+  # provisioner) the moment the cluster this stack creates becomes active, and every
+  # single pod, including those, needs the "pause" sandbox image first - all from
+  # Docker Hub, not our ECR, with a cache wiped clean on every apply since Floci
+  # recreates the cluster's node container every time (PLAN.md's accepted Option (c)).
+  # Confirmed on a live run that importing these from deploy.sh itself, after this
+  # stack's apply returns, still isn't early enough: Terraform creates RDS/MSK/
+  # ElastiCache in parallel with the cluster, so "after apply" can trail the cluster's
+  # own activation by minutes - long enough for those system pods to already have
+  # failed several pulls and backed off, so the images becoming available didn't help
+  # until an existing backoff timer expired. A null_resource in this stack, depending
+  # on only the EKS cluster resource, runs concurrently with everything else in this
+  # apply instead, closing that gap to the minimum possible - built here, before the
+  # apply, since Terraform's own local-exec isn't a reliable place to also build them.
   #
   # `docker save` on these specific manifest-list images produces a tarball missing a
   # referenced layer blob (confirmed directly: rancher/mirrored-metrics-server:v0.8.0
@@ -250,15 +241,19 @@ if [[ "$TARGET" == "floci" ]]; then
       printf 'FROM %s\n' "$img" | docker buildx build --platform linux/arm64 -f - -o type=docker,dest="$tarfile" "$ROOT" >/dev/null
     done
   fi
-  k3s_node_container="floci-eks-$PROJECT"
-  if docker inspect "$k3s_node_container" >/dev/null 2>&1; then
-    for tarfile in "$K3S_IMAGE_DIR"/*.tar; do
-      docker cp "$tarfile" "$k3s_node_container:/tmp/k3s-image.tar"
-      docker exec "$k3s_node_container" ctr -n k8s.io images import /tmp/k3s-image.tar >/dev/null
-      docker exec "$k3s_node_container" rm -f /tmp/k3s-image.tar
-    done
-  fi
+  k3s_image_dir_json=",
+  \"floci_k3s_image_dir\": \"$K3S_IMAGE_DIR\""
 fi
+cat > "$INFRA/deploy.auto.tfvars.json" <<EOF
+{
+  "region": "$AWS_REGION",
+  "project": "$PROJECT",
+  "target": "$TARGET",
+  "create_opensearch_service_linked_role": $create_slr$allowed_json$iot_endpoint_json$k3s_image_dir_json
+}
+EOF
+
+tf "$INFRA" apply -input=false -auto-approve
 
 REGISTRY="$(tf "$INFRA" output -raw ecr_registry)"
 CLUSTER="$(tf "$INFRA" output -raw cluster_name)"

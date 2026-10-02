@@ -174,6 +174,19 @@ resource "null_resource" "opensearch_floci" {
       # does. "Already exists" from create-domain is expected and tolerated: it can
       # legitimately fire when Floci's own state disagrees with the container's.
       if [ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
+        # Confirmed on a live run that create-domain can also report
+        # ResourceAlreadyExistsException for a domain whose container is confirmed
+        # missing right here, even within a single session's retries, not only across
+        # old ones - Floci's control plane doesn't always clear its own record even
+        # though nothing was ever spawned to back it. In that case create-domain does
+        # nothing further, so the container never appears no matter how long the
+        # health check below waits. Clear any such stale record first unconditionally;
+        # delete-domain on a domain that's genuinely fine to begin with is a no-op.
+        # Called twice: separately confirmed that a single delete-domain call doesn't
+        # always fully take effect either (describe-domain kept reporting "Deleted":
+        # false after just one).
+        aws opensearch delete-domain --domain-name "$name" >/dev/null 2>&1 || true
+        aws opensearch delete-domain --domain-name "$name" >/dev/null 2>&1 || true
         aws opensearch create-domain \
           --domain-name "$name" \
           --engine-version '${var.opensearch_version}' \

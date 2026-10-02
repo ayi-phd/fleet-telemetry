@@ -44,6 +44,48 @@ resource "aws_eks_cluster" "this" {
   depends_on = [aws_iam_role_policy_attachment.eks_cluster]
 }
 
+# k3s auto-schedules its own system pods (CoreDNS, metrics-server, the local-path
+# provisioner) the moment the cluster above becomes active, and every single pod,
+# including those, needs the "pause" sandbox image first - all from Docker Hub, not our
+# ECR, with a cache wiped clean on every apply since Floci recreates this cluster's node
+# container every time (see PLAN.md's accepted Option (c)). Confirmed on a live run that
+# importing these from deploy.sh itself, right after this whole stack's apply returns,
+# still isn't early enough: Terraform creates RDS/MSK/ElastiCache in parallel with this
+# cluster, so "right after apply" can trail the cluster's own activation by minutes -
+# long enough for those system pods to already have failed several pulls and backed
+# off, so the images becoming available didn't help until an existing backoff timer
+# expired. A null_resource depending on only the cluster runs concurrently with
+# everything else in this apply instead, closing that gap to the minimum possible -
+# except null_resource.opensearch_floci specifically, confirmed on a live run to
+# contend for Docker itself (OpenSearch's own 2-minute health-check loop polls it every
+# 2 seconds) badly enough that running both at once made the health check miss its
+# window outright, twice in a row. Running after that one specifically, rather than
+# after the whole apply, is still a large improvement for the actual regression this is
+# fixing, since nothing else running concurrently in this apply touches Docker itself
+# the way these two do. deploy.sh builds the tarballs this imports from, before calling
+# apply.
+resource "null_resource" "k3s_system_images_floci" {
+  count      = local.floci && var.floci_k3s_image_dir != "" ? 1 : 0
+  depends_on = [aws_eks_cluster.this, null_resource.opensearch_floci]
+
+  triggers = {
+    cluster_id = aws_eks_cluster.this.id
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -euo pipefail
+      container="floci-eks-${local.name}"
+      for tarfile in "${var.floci_k3s_image_dir}"/*.tar; do
+        [ -e "$tarfile" ] || continue
+        docker cp "$tarfile" "$container:/tmp/k3s-image.tar"
+        docker exec "$container" ctr -n k8s.io images import /tmp/k3s-image.tar >/dev/null
+        docker exec "$container" rm -f /tmp/k3s-image.tar
+      done
+    EOT
+  }
+}
+
 data "aws_iam_policy_document" "eks_node_assume" {
   statement {
     actions = ["sts:AssumeRole"]
