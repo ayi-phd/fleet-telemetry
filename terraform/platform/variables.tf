@@ -26,6 +26,16 @@ variable "floci_deploy_secret_access_key" {
   sensitive = true
 }
 
+variable "stream_raw" {
+  description = "Raw-telemetry ingestion transport: \"msk\" or \"kinesis\". Set by deploy.sh; must match the infra stack's value. See PLAN.md Phase 7."
+  type        = string
+  default     = "msk"
+  validation {
+    condition     = contains(["msk", "kinesis"], var.stream_raw)
+    error_message = "stream_raw must be \"msk\" or \"kinesis\"."
+  }
+}
+
 variable "floci_extra_hosts" {
   description = "Newline-separated \"ip name\" pairs for every floci-* container, discovered by deploy.sh. iot-kafka-bridge writes these into its own /etc/hosts at startup: its execution containers sit outside the k3s cluster (deploy.sh's node/CoreDNS patching doesn't reach them), yet Kafka's protocol advertises MSK's randomly-suffixed container name in metadata responses, so even an IP bootstrap address isn't enough for the follow-up produce request. Set by deploy.sh; unused on AWS."
   type        = string

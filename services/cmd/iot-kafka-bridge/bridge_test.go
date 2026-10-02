@@ -107,7 +107,10 @@ func TestInvoke_ProducesUnmodifiedRecord(t *testing.T) {
 	defer cl.Close()
 
 	fixedNow := time.UnixMilli(1_700_000_000_000)
-	h := &bridgeHandler{cl: cl, topic: "raw-telemetry", log: quietLogger(), now: func() time.Time { return fixedNow }}
+	h := &bridgeHandler{
+		producer: &kafkaProducer{cl: cl, topic: "raw-telemetry", now: func() time.Time { return fixedNow }},
+		log:      quietLogger(),
+	}
 
 	payload := testTelemetry("SIM00000000000003")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -165,7 +168,7 @@ func TestInvoke_ReturnsErrorWhenProduceFails(t *testing.T) {
 	}
 	defer cl.Close()
 
-	h := &bridgeHandler{cl: cl, topic: "raw-telemetry", log: quietLogger()}
+	h := &bridgeHandler{producer: &kafkaProducer{cl: cl, topic: "raw-telemetry"}, log: quietLogger()}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -27,7 +27,10 @@ locals {
 }
 
 data "aws_iam_policy_document" "irsa_trust" {
-  for_each = local.floci ? toset([]) : toset(["realtime-router", "dashboard-api"])
+  for_each = local.floci ? toset([]) : toset(concat(
+    ["realtime-router", "dashboard-api"],
+    var.stream_raw == "kinesis" ? ["telemetry-processor"] : []
+  ))
 
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
@@ -92,6 +95,35 @@ resource "aws_iam_role_policy" "dashboard_api" {
       Effect   = "Allow"
       Action   = ["es:ESHttpGet", "es:ESHttpHead", "es:ESHttpPost"] # search is a POST
       Resource = ["${local.opensearch_arn}/*"]
+    }]
+  })
+}
+
+# Only exists when stream_raw="kinesis" - telemetry-processor needs no AWS
+# permissions at all on the msk path (same as today, where it has no IAM role).
+# Unlike realtime_router/dashboard_api above (always created, used by every target
+# for OpenSearch), gating this on stream_raw avoids a permanently-unused role.
+resource "aws_iam_role" "telemetry_processor" {
+  count              = var.stream_raw == "kinesis" ? 1 : 0
+  name               = "${local.name}-telemetry-processor"
+  assume_role_policy = local.floci ? data.aws_iam_policy_document.floci_role_trust[0].json : data.aws_iam_policy_document.irsa_trust["telemetry-processor"].json
+}
+
+resource "aws_iam_role_policy" "telemetry_processor" {
+  count = var.stream_raw == "kinesis" ? 1 : 0
+  role  = aws_iam_role.telemetry_processor[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "kinesis:GetRecords",
+        "kinesis:GetShardIterator",
+        "kinesis:ListShards",
+        "kinesis:DescribeStreamSummary",
+        "kinesis:DescribeStream",
+      ]
+      Resource = [aws_kinesis_stream.raw_telemetry[0].arn]
     }]
   })
 }

@@ -66,6 +66,7 @@ fi
 # The target comes from the infra state, so destroy always matches what deploy created;
 # TARGET in the environment is not consulted.
 TARGET="$(tf "$INFRA" output -raw target 2>/dev/null || echo aws)"
+STREAM_RAW="$(tf "$INFRA" output -raw stream_raw 2>/dev/null || echo msk)"
 
 if [[ "$TARGET" == "floci" ]]; then
   FLOCI_ENDPOINT="${FLOCI_ENDPOINT:-http://localhost:4566}"
@@ -101,11 +102,11 @@ fi
 # --------------------------------------------------------------------------
 step "1/3: Removing workloads, the dashboard load balancer and simulated IoT devices"
 if has_state "$PLATFORM"; then
-  # The iot-kafka-bridge Lambda's security group can't be deleted until AWS finishes
-  # releasing its ENI, which can take several minutes after the function is gone.
-  # Floci's Lambda has no VPC config (no ENI), so one attempt is enough there.
-  platform_attempts=3
-  [[ "$TARGET" == "floci" ]] && platform_attempts=1
+  # The iot-kafka-bridge Lambda now only exists on Floci (Phase 7: AWS routes IoT Core
+  # into the raw stream natively, no Lambda, for either STREAM_RAW), and Floci's Lambda
+  # has never had a VPC config (no ENI) - so there's no longer a VPC-release wait in this
+  # stack on either target. One attempt is enough everywhere.
+  platform_attempts=1
   platform_destroyed=0
   for attempt in $(seq 1 "$platform_attempts"); do
     if tf "$PLATFORM" destroy -input=false -auto-approve; then platform_destroyed=1; break; fi
@@ -181,12 +182,16 @@ cleanup_vpc_leftovers() {
 
 if has_state "$INFRA"; then
   destroyed=0
-  # The iot-kafka-bridge Lambda's ENIs (platform stack) can take 20+ minutes to release
-  # after the function is deleted, and block subnet/VPC deletion here until they do.
-  # Floci has no NAT gateway or Lambda ENIs to wait for, so one attempt is enough there.
+  # On AWS with STREAM_RAW=msk, the native Kafka IoT rule action's VPC destination owns
+  # ENIs in these subnets (replacing the Lambda's own ENIs, which this wait used to be
+  # about - the Lambda is Floci-only since Phase 7) and can take 20+ minutes to release
+  # after the destination is deleted, blocking subnet/VPC deletion here until they do.
+  # STREAM_RAW=kinesis has no VPC destination at all (the native Kinesis action needs no
+  # VPC), and Floci has no NAT gateway or destination ENIs either - one attempt is enough
+  # in both of those cases.
   infra_attempts=4
   infra_sleep=300
-  if [[ "$TARGET" == "floci" ]]; then
+  if [[ "$TARGET" == "floci" || "$STREAM_RAW" == "kinesis" ]]; then
     infra_attempts=1
     infra_sleep=10
   fi

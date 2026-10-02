@@ -112,3 +112,30 @@ output "dashboard_api_role_arn" {
   description = "IRSA role for the dashboard-api Kubernetes service account."
   value       = aws_iam_role.dashboard_api.arn
 }
+
+output "telemetry_processor_role_arn" {
+  description = "IRSA role for the telemetry-processor Kubernetes service account. Only exists when stream_raw=\"kinesis\" (it needs no AWS permissions at all on the msk path, same as today)."
+  value       = var.stream_raw == "kinesis" ? aws_iam_role.telemetry_processor[0].arn : ""
+}
+
+output "raw_stream_name" {
+  value = var.stream_raw == "kinesis" ? aws_kinesis_stream.raw_telemetry[0].name : ""
+}
+
+output "raw_stream_arn" {
+  value = var.stream_raw == "kinesis" ? aws_kinesis_stream.raw_telemetry[0].arn : ""
+}
+
+output "raw_stream_endpoint" {
+  description = "Floci serves Kinesis from its central gateway container, not a per-service endpoint; real AWS needs no override. Empty unless stream_raw=\"kinesis\" on Floci."
+  value       = local.floci && var.stream_raw == "kinesis" ? "http://floci:4566" : ""
+}
+
+output "msk_scram_secret_arn" {
+  description = "Reused by the native IoT kafka rule action's get_secret() calls (stream_raw=\"msk\", AWS only) - the same secret the Go services already authenticate with, not a new one."
+  value       = local.floci ? "" : aws_secretsmanager_secret.msk_scram[0].arn
+}
+
+output "msk_scram_kms_key_arn" {
+  value = local.floci ? "" : aws_kms_key.msk_scram[0].arn
+}

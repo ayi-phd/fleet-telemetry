@@ -121,3 +121,19 @@ variable "floci_k3s_image_dir" {
   type        = string
   default     = ""
 }
+
+variable "stream_raw" {
+  description = "Raw-telemetry ingestion transport: \"msk\" or \"kinesis\". Set by deploy.sh. See PLAN.md Phase 7 - only the IoT Core -> raw stream hop switches; telemetry-processor's own output stays on MSK/Kafka regardless."
+  type        = string
+  default     = "msk"
+  validation {
+    condition     = contains(["msk", "kinesis"], var.stream_raw)
+    error_message = "stream_raw must be \"msk\" or \"kinesis\"."
+  }
+}
+
+variable "raw_stream_shards" {
+  description = "Kinesis shard count when stream_raw=\"kinesis\", on real AWS. Floci forces 1 regardless (single-node emulation, mirroring how MSK's replication is forced down there too)."
+  type        = number
+  default     = 6
+}

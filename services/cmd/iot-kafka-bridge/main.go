@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"strings"
@@ -19,6 +20,27 @@ func main() {
 	log := platform.NewLogger("iot-kafka-bridge")
 	patchFlociHosts(log)
 
+	producer, closeFn := newProducer(log)
+	defer closeFn()
+
+	h := &bridgeHandler{producer: producer, log: log}
+	lambda.StartHandler(h)
+}
+
+// newProducer picks a RawProducer based on STREAM_RAW (default "msk", today's
+// behavior). This binary only runs on Floci after PLAN.md Phase 7 - real AWS routes
+// IoT Core directly into the raw stream via a native rule action instead - but it
+// still needs to speak either transport, since Floci can be configured for either.
+func newProducer(log *slog.Logger) (producer RawProducer, closeFn func()) {
+	if platform.Env("STREAM_RAW", "msk") == "kinesis" {
+		kin, err := platform.NewKinesis(context.Background(), platform.MustEnv("AWS_REGION"))
+		if err != nil {
+			log.Error("kinesis client", "err", err)
+			os.Exit(1)
+		}
+		return &kinesisProducer{kin: kin, stream: platform.MustEnv("RAW_STREAM_NAME")}, func() {}
+	}
+
 	kc := platform.KafkaConfigFromEnv()
 	cl, err := kgo.NewClient(append(kc.Opts(),
 		kgo.ProducerBatchCompression(kgo.Lz4Compression()),
@@ -27,10 +49,7 @@ func main() {
 		log.Error("kafka client", "err", err)
 		os.Exit(1)
 	}
-	defer cl.Close()
-
-	h := &bridgeHandler{cl: cl, topic: platform.Env("RAW_TOPIC", "raw-telemetry"), log: log}
-	lambda.StartHandler(h)
+	return &kafkaProducer{cl: cl, topic: platform.Env("RAW_TOPIC", "raw-telemetry")}, cl.Close
 }
 
 // patchFlociHosts appends FLOCI_EXTRA_HOSTS's "ip name" lines to /etc/hosts. Floci's
