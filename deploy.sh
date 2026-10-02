@@ -213,6 +213,53 @@ EOF
 
 tf "$INFRA" apply -input=false -auto-approve
 
+if [[ "$TARGET" == "floci" ]]; then
+  # k3s auto-schedules its own system pods (CoreDNS, metrics-server, the local-path
+  # provisioner) the moment the cluster above becomes active - and every single pod,
+  # including those, needs the "pause" sandbox image first. All of these come from
+  # Docker Hub, not our ECR, and the node container is recreated fresh on every apply
+  # (Floci re-deploys always recreate the EKS cluster; see PLAN.md's accepted Option
+  # (c)), wiping their cache right along with it. Confirmed on a live run: importing
+  # these right here, before Stage 2's image builds even start, is not just cleanup -
+  # running this later (originally placed in Stage 3, right before the DNS patch below)
+  # left a multi-minute gap after the cluster activates during which those system pods
+  # had already failed several pull attempts and backed off, so by the time the images
+  # became available they were stuck waiting out an existing backoff timer rather than
+  # retrying immediately - which is what actually stalled rbac-authz for 10+ minutes
+  # offline until Kubernetes' own rollout deadline gave up first.
+  #
+  # `docker save` on these specific manifest-list images produces a tarball missing a
+  # referenced layer blob (confirmed directly: rancher/mirrored-metrics-server:v0.8.0
+  # alone, saved alone, still comes out short one blob its own legacy manifest.json
+  # lists as required - a Docker Desktop/containerd-image-store bug, not anything about
+  # how we invoke it), which only surfaces later as a cryptic "content digest ... not
+  # found" when containerd actually extracts the layer. `docker buildx build`'s own
+  # image export (-o type=docker) resolves and bundles the same image correctly -
+  # confirmed by forcing real layer extraction (`ctr run`) afterward for every image.
+  K3S_SYSTEM_IMAGES=(
+    rancher/mirrored-pause:3.6
+    rancher/mirrored-coredns-coredns:1.12.3
+    rancher/mirrored-metrics-server:v0.8.0
+    rancher/local-path-provisioner:v0.0.32
+  )
+  K3S_IMAGE_DIR="$ROOT/.floci-k3s-images"
+  if [[ ! -d "$K3S_IMAGE_DIR" ]]; then
+    mkdir -p "$K3S_IMAGE_DIR"
+    for img in "${K3S_SYSTEM_IMAGES[@]}"; do
+      tarfile="$K3S_IMAGE_DIR/$(tr '/:' '__' <<<"$img").tar"
+      printf 'FROM %s\n' "$img" | docker buildx build --platform linux/arm64 -f - -o type=docker,dest="$tarfile" "$ROOT" >/dev/null
+    done
+  fi
+  k3s_node_container="floci-eks-$PROJECT"
+  if docker inspect "$k3s_node_container" >/dev/null 2>&1; then
+    for tarfile in "$K3S_IMAGE_DIR"/*.tar; do
+      docker cp "$tarfile" "$k3s_node_container:/tmp/k3s-image.tar"
+      docker exec "$k3s_node_container" ctr -n k8s.io images import /tmp/k3s-image.tar >/dev/null
+      docker exec "$k3s_node_container" rm -f /tmp/k3s-image.tar
+    done
+  fi
+fi
+
 REGISTRY="$(tf "$INFRA" output -raw ecr_registry)"
 CLUSTER="$(tf "$INFRA" output -raw cluster_name)"
 NAMESPACE="$(tf "$INFRA" output -raw kubernetes_namespace)"
@@ -309,46 +356,6 @@ if [[ "$TARGET" == "floci" ]]; then
   # re-deploys always recreate the EKS cluster; see PLAN.md's accepted Option (c)),
   # so this runs, and re-patches both places below, on every deploy.
   node_container="floci-eks-$PROJECT"
-
-  # k3s's own system pods (CoreDNS, metrics-server, the local-path provisioner) and the
-  # "pause" sandbox container every single pod needs all come from Docker Hub, not our
-  # ECR - and since the node container above is recreated fresh on every apply, their
-  # cache is wiped right along with it, needing a fresh pull on every single deploy.
-  # Confirmed on a live run: this is exactly what stalled rbac-authz's pod for 10+
-  # minutes offline (repeated "FailedCreatePodSandBox" retries for the pause image)
-  # until Kubernetes' own rollout deadline gave up first. Pull each one once into the
-  # host's persistent image store, then import them straight into the fresh node
-  # container's containerd store on every deploy - the host-side cache survives the
-  # node container being recreated, even though the node's own cache doesn't.
-  K3S_SYSTEM_IMAGES=(
-    rancher/mirrored-pause:3.6
-    rancher/mirrored-coredns-coredns:1.12.3
-    rancher/mirrored-metrics-server:v0.8.0
-    rancher/local-path-provisioner:v0.0.32
-  )
-  # `docker save` on these specific manifest-list images produces a tarball missing a
-  # referenced layer blob (confirmed directly: rancher/mirrored-metrics-server:v0.8.0
-  # alone, saved alone, still comes out short one blob its own legacy manifest.json
-  # lists as required - a Docker Desktop/containerd-image-store bug, not anything
-  # about how we invoke it), which only surfaces later as a cryptic "content digest
-  # ... not found" when containerd actually extracts the layer. `docker buildx build`'s
-  # own image export (-o type=docker) resolves and bundles the same image correctly -
-  # confirmed by forcing real layer extraction (`ctr run`) afterward for every image.
-  K3S_IMAGE_DIR="$ROOT/.floci-k3s-images"
-  if [[ ! -d "$K3S_IMAGE_DIR" ]]; then
-    mkdir -p "$K3S_IMAGE_DIR"
-    for img in "${K3S_SYSTEM_IMAGES[@]}"; do
-      tarfile="$K3S_IMAGE_DIR/$(tr '/:' '__' <<<"$img").tar"
-      printf 'FROM %s\n' "$img" | docker buildx build --platform linux/arm64 -f - -o type=docker,dest="$tarfile" "$ROOT" >/dev/null
-    done
-  fi
-  if docker inspect "$node_container" >/dev/null 2>&1; then
-    for tarfile in "$K3S_IMAGE_DIR"/*.tar; do
-      docker cp "$tarfile" "$node_container:/tmp/k3s-image.tar"
-      docker exec "$node_container" ctr -n k8s.io images import /tmp/k3s-image.tar >/dev/null
-      docker exec "$node_container" rm -f /tmp/k3s-image.tar
-    done
-  fi
 
   floci_hosts="" # newline-separated "ip name" pairs, no indentation (added by consumers)
   add_floci_host() {
