@@ -55,18 +55,22 @@ resource "aws_eks_cluster" "this" {
 # long enough for those system pods to already have failed several pulls and backed
 # off, so the images becoming available didn't help until an existing backoff timer
 # expired. A null_resource depending on only the cluster runs concurrently with
-# everything else in this apply instead, closing that gap to the minimum possible -
-# except null_resource.opensearch_floci specifically, confirmed on a live run to
-# contend for Docker itself (OpenSearch's own 2-minute health-check loop polls it every
-# 2 seconds) badly enough that running both at once made the health check miss its
-# window outright, twice in a row. Running after that one specifically, rather than
-# after the whole apply, is still a large improvement for the actual regression this is
-# fixing, since nothing else running concurrently in this apply touches Docker itself
-# the way these two do. deploy.sh builds the tarballs this imports from, before calling
-# apply.
+# everything else in this apply instead, closing that gap to the minimum possible.
+#
+# This does contend for Docker itself with null_resource.opensearch_floci specifically
+# (OpenSearch's own health-check loop polls it every 2 seconds) badly enough to make
+# that loop miss its window outright on a live run - sequencing after it instead fixed
+# that, but cost enough of the gap this resource exists to close that kube-system pods
+# were still seen retrying for several minutes before succeeding, instead of failing
+# outright. Running concurrently again and giving the OpenSearch health check more
+# budget to tolerate the contention (see its own comment) is the better trade: nothing
+# else running concurrently in this apply touches Docker the way these two do, so nothing
+# else is at risk, and it actually closes the gap this resource exists to close instead
+# of trading one regression for a smaller one. deploy.sh builds the tarballs this imports
+# from, before calling apply.
 resource "null_resource" "k3s_system_images_floci" {
   count      = local.floci && var.floci_k3s_image_dir != "" ? 1 : 0
-  depends_on = [aws_eks_cluster.this, null_resource.opensearch_floci]
+  depends_on = [aws_eks_cluster.this]
 
   triggers = {
     cluster_id = aws_eks_cluster.this.id

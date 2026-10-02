@@ -194,7 +194,12 @@ resource "null_resource" "opensearch_floci" {
           --ebs-options 'EBSEnabled=true,VolumeType=gp3,VolumeSize=20' \
           >/dev/null 2>&1 || true
       fi
-      for i in $(seq 1 60); do
+      # 150 iterations (5 minutes), not the original 60 (2 minutes): confirmed on a
+      # live run that null_resource.k3s_system_images_floci running concurrently (both
+      # hit Docker itself, via docker exec) can slow this down enough to miss a
+      # 2-minute budget outright, even though the container normally comes up within
+      # about a minute on its own.
+      for i in $(seq 1 150); do
         docker exec "$container" curl -fsS http://localhost:9200 >/dev/null 2>&1 && exit 0
         sleep 2
       done
