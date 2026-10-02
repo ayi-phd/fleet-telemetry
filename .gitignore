@@ -15,9 +15,14 @@ terraform/platform/floci-ca.pem
 # CLI config pointing at it; built by deploy.sh on first use, machine-specific
 .floci-provider-mirror/
 .floci.tfrc
+# k3s's own system images (pause, CoreDNS, metrics-server, local-path-provisioner),
+# re-imported into the Floci EKS node container on every deploy since it's recreated
+# fresh each time; built by deploy.sh on first use, machine-specific
+.floci-k3s-images/
 
 # Build output
 .build-*.log
+.floci-*.Dockerfile
 services/gen/
 web/node_modules/
 web/dist/

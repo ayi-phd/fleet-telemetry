@@ -174,6 +174,19 @@ resource "null_resource" "opensearch_floci" {
       # does. "Already exists" from create-domain is expected and tolerated: it can
       # legitimately fire when Floci's own state disagrees with the container's.
       if [ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
+        # Confirmed on a live run that create-domain can also report
+        # ResourceAlreadyExistsException for a domain whose container is confirmed
+        # missing right here, even within a single session's retries, not only across
+        # old ones - Floci's control plane doesn't always clear its own record even
+        # though nothing was ever spawned to back it. In that case create-domain does
+        # nothing further, so the container never appears no matter how long the
+        # health check below waits. Clear any such stale record first unconditionally;
+        # delete-domain on a domain that's genuinely fine to begin with is a no-op.
+        # Called twice: separately confirmed that a single delete-domain call doesn't
+        # always fully take effect either (describe-domain kept reporting "Deleted":
+        # false after just one).
+        aws opensearch delete-domain --domain-name "$name" >/dev/null 2>&1 || true
+        aws opensearch delete-domain --domain-name "$name" >/dev/null 2>&1 || true
         aws opensearch create-domain \
           --domain-name "$name" \
           --engine-version '${var.opensearch_version}' \
@@ -181,7 +194,12 @@ resource "null_resource" "opensearch_floci" {
           --ebs-options 'EBSEnabled=true,VolumeType=gp3,VolumeSize=20' \
           >/dev/null 2>&1 || true
       fi
-      for i in $(seq 1 60); do
+      # 150 iterations (5 minutes), not the original 60 (2 minutes): confirmed on a
+      # live run that null_resource.k3s_system_images_floci running concurrently (both
+      # hit Docker itself, via docker exec) can slow this down enough to miss a
+      # 2-minute budget outright, even though the container normally comes up within
+      # about a minute on its own.
+      for i in $(seq 1 150); do
         docker exec "$container" curl -fsS http://localhost:9200 >/dev/null 2>&1 && exit 0
         sleep 2
       done

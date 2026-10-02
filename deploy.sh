@@ -39,6 +39,13 @@ PROJECT="${PROJECT:-fleet-telemetry}"
 # deploy here with no other reason to need the network at all).
 INIT_UPGRADE_FLAG=""
 [[ "$TARGET" == "aws" ]] && INIT_UPGRADE_FLAG="-upgrade"
+# docker buildx build checks the registry for a mutable base-image tag's latest digest
+# by default, even when a matching image is already cached locally - real work only on
+# AWS (catching a genuinely updated/security-patched base image), pure liability on
+# Floci (confirmed on a live run: it failed outright while offline, on both base images,
+# despite them already being in BuildKit's local cache from an earlier build).
+BUILD_PULL_FLAG="--pull"
+[[ "$TARGET" == "floci" ]] && BUILD_PULL_FLAG="--pull=false"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -195,12 +202,66 @@ fi
 iot_endpoint_json=""
 [[ "$TARGET" == "floci" ]] && iot_endpoint_json=",
   \"iot_endpoint_override\": \"$FLOCI_IOT_ENDPOINT\""
+k3s_image_dir_json=""
+if [[ "$TARGET" == "floci" ]]; then
+  # k3s auto-schedules its own system pods (CoreDNS, metrics-server, the local-path
+  # provisioner) the moment the cluster this stack creates becomes active, and every
+  # single pod, including those, needs the "pause" sandbox image first - all from
+  # Docker Hub, not our ECR, with a cache wiped clean on every apply since Floci
+  # recreates the cluster's node container every time (PLAN.md's accepted Option (c)).
+  # Confirmed on a live run that importing these from deploy.sh itself, after this
+  # stack's apply returns, still isn't early enough: Terraform creates RDS/MSK/
+  # ElastiCache in parallel with the cluster, so "after apply" can trail the cluster's
+  # own activation by minutes - long enough for those system pods to already have
+  # failed several pulls and backed off, so the images becoming available didn't help
+  # until an existing backoff timer expired. A null_resource in this stack, depending
+  # on only the EKS cluster resource, runs concurrently with everything else in this
+  # apply instead, closing that gap to the minimum possible - built here, before the
+  # apply, since Terraform's own local-exec isn't a reliable place to also build them.
+  #
+  # `docker save` on these specific manifest-list images produces a tarball missing a
+  # referenced layer blob (confirmed directly: rancher/mirrored-metrics-server:v0.8.0
+  # alone, saved alone, still comes out short one blob its own legacy manifest.json
+  # lists as required - a Docker Desktop/containerd-image-store bug, not anything about
+  # how we invoke it), which only surfaces later as a cryptic "content digest ... not
+  # found" when containerd actually extracts the layer. `docker buildx build`'s own
+  # image export (-o type=docker) resolves and bundles the same image correctly -
+  # confirmed by forcing real layer extraction (`ctr run`) afterward for every image.
+  K3S_SYSTEM_IMAGES=(
+    rancher/mirrored-pause:3.6
+    rancher/mirrored-coredns-coredns:1.12.3
+    rancher/mirrored-metrics-server:v0.8.0
+    rancher/local-path-provisioner:v0.0.32
+  )
+  K3S_IMAGE_DIR="$ROOT/.floci-k3s-images"
+  if [[ ! -d "$K3S_IMAGE_DIR" ]]; then
+    mkdir -p "$K3S_IMAGE_DIR"
+    for img in "${K3S_SYSTEM_IMAGES[@]}"; do
+      tarfile="$K3S_IMAGE_DIR/$(tr '/:' '__' <<<"$img").tar"
+      # -t matters here, not just for readability: without it the exported tar's
+      # manifest has RepoTags:null, so `ctr images import` on the node can only
+      # register the image by digest, never by the tag k3s's own containerd
+      # config requests for the sandbox/system images - meaning the import
+      # silently never satisfies that lookup, and every pod needing it falls
+      # through to a live registry pull regardless. Confirmed on a live run:
+      # removing the imported tag reference and re-importing from the
+      # untagged tar left only the digest reference, and `ctr run` against the
+      # tag then failed with "not found" - this is what was actually causing
+      # every offline rbac-authz/CoreDNS stall this whole saga, not a timing
+      # race; it only ever appeared to work because the network came back
+      # before kubelet gave up.
+      printf 'FROM %s\n' "$img" | docker buildx build --platform linux/arm64 -t "$img" -f - -o type=docker,dest="$tarfile" "$ROOT" >/dev/null
+    done
+  fi
+  k3s_image_dir_json=",
+  \"floci_k3s_image_dir\": \"$K3S_IMAGE_DIR\""
+fi
 cat > "$INFRA/deploy.auto.tfvars.json" <<EOF
 {
   "region": "$AWS_REGION",
   "project": "$PROJECT",
   "target": "$TARGET",
-  "create_opensearch_service_linked_role": $create_slr$allowed_json$iot_endpoint_json
+  "create_opensearch_service_linked_role": $create_slr$allowed_json$iot_endpoint_json$k3s_image_dir_json
 }
 EOF
 
@@ -212,6 +273,25 @@ NAMESPACE="$(tf "$INFRA" output -raw kubernetes_namespace)"
 
 # --------------------------------------------------------------------------
 step "Stage 2/4: Building and pushing container images"
+if [[ "$TARGET" == "floci" ]]; then
+  # docker buildx build's own cache for a mutable base-image tag isn't reliably
+  # persistent even with --pull=false: confirmed on a live run that it still failed
+  # outright while offline a week after building successfully, because BuildKit's
+  # build cache (unlike a plain `docker pull`) is explicitly reclaimable and had
+  # evicted it in the meantime. Pull each base image once into Docker's regular,
+  # non-reclaimed image store instead - keep this list in sync with the FROM lines in
+  # services/Dockerfile and web/Dockerfile.
+  for base_image in \
+    golang:1.26-bookworm \
+    gcr.io/distroless/static-debian12:nonroot \
+    public.ecr.aws/lambda/provided:al2023 \
+    node:22-alpine \
+    nginxinc/nginx-unprivileged:1.27-alpine
+  do
+    docker image inspect "$base_image" >/dev/null 2>&1 \
+      || docker pull --platform linux/arm64 "$base_image" >/dev/null
+  done
+fi
 if [[ -z "${IMAGE_TAG:-}" ]]; then
   sha="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo build)"
   IMAGE_TAG="${sha}-$(date -u +%Y%m%d%H%M%S)"
@@ -225,11 +305,22 @@ aws ecr get-login-password | docker login --username AWS --password-stdin "$REGI
 build() { # <repo name> <dockerfile> <context> [build args...]
   local repo="$1" file="$2" context="$3"; shift 3
   info "Building $repo"
-  docker buildx build --platform linux/arm64 --provenance=false --push \
+  # A "# syntax=" directive makes BuildKit pull an external frontend image from Docker
+  # Hub before it can even parse the Dockerfile - fine on AWS, but breaks a fully-offline
+  # Floci deploy (confirmed on a live run: the same DNS-resolution-failure signature as
+  # the earlier Terraform provider issue). Nothing here actually needs it - cache mounts
+  # have been supported by Docker's own built-in default frontend for years - so strip
+  # it for Floci builds only; AWS builds keep the explicit pin unchanged.
+  if [[ "$TARGET" == "floci" ]]; then
+    local floci_file="$ROOT/.floci-$repo.Dockerfile"
+    sed '/^# syntax=/d' "$file" >"$floci_file"
+    file="$floci_file"
+  fi
+  docker buildx build --platform linux/arm64 --provenance=false --push $BUILD_PULL_FLAG \
     -f "$file" -t "$REGISTRY/$PROJECT/$repo:$IMAGE_TAG" "$@" "$context" \
     >"$ROOT/.build-$repo.log" 2>&1 \
     || { tail -n 40 "$ROOT/.build-$repo.log" >&2; die "Image build for $repo failed (full log: .build-$repo.log)."; }
-  rm -f "$ROOT/.build-$repo.log"
+  rm -f "$ROOT/.build-$repo.log" "$ROOT/.floci-$repo.Dockerfile"
 }
 for svc in "${SERVICES[@]}"; do
   build "$svc" "$ROOT/services/Dockerfile" "$ROOT" --target runtime-standard --build-arg "SERVICE=$svc"
@@ -272,6 +363,7 @@ if [[ "$TARGET" == "floci" ]]; then
   # re-deploys always recreate the EKS cluster; see PLAN.md's accepted Option (c)),
   # so this runs, and re-patches both places below, on every deploy.
   node_container="floci-eks-$PROJECT"
+
   floci_hosts="" # newline-separated "ip name" pairs, no indentation (added by consumers)
   add_floci_host() {
     local cname="$1" hostname="$2"

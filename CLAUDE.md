@@ -73,6 +73,7 @@ PostgreSQL holds vehicle↔fleet assignments and grants.
 | ECR repo naming `${project}/${service}` in `terraform/infra/ecr.tf` | image references built by `deploy.sh` |
 | `dashboard_allowed_cidrs` | `load_balancer_source_ranges` on the web Service (the in-tree NLB otherwise opens NodePorts to 0.0.0.0/0) |
 | The set of services or images | the build loop and ECR checks in `deploy.sh`, the ECR repositories, README |
+| A `FROM` line in `services/Dockerfile` or `web/Dockerfile` | the base-image pull list in `deploy.sh`'s Stage 2 (Floci only - pulls each one into the persistent image store once, for offline builds) |
 
 ## Conventions
 
