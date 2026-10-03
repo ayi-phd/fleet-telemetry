@@ -256,9 +256,10 @@ TARGET=floci ./destroy.sh   # Floci itself keeps running
 ```
 
 The full pipeline (simulator → IoT → Lambda → MSK → dashboard) has been verified working
-end to end on Floci, including permission filtering across two different users (the
-`STREAM_RAW=kinesis`/no-Lambda-on-AWS path is new and not yet verified against a live Floci or
-AWS run). Getting
+end to end on Floci, including permission filtering across two different users. Both
+`STREAM_RAW=msk` and `STREAM_RAW=kinesis` are confirmed working end to end on Floci too; the
+no-Lambda native rule actions AWS uses instead are still unverified against a real AWS account.
+Getting
 there took working around a long list of real Floci-side bugs and gaps, one at a time —
 see below.
 
