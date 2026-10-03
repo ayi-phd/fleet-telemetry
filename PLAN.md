@@ -681,9 +681,20 @@ templates, so it doesn't need the Lambda for either stream type.
 **Verified after this phase**: `go build ./...`, `go vet ./...`, `go test ./...` (all pass;
 `make`'s own `build`/`test` targets still fail on this machine for the pre-existing,
 unrelated reason noted in Phase 0 — `protoc` isn't installed here) — `terraform fmt -recursive`
-and `terraform validate` in both stacks — `bash -n deploy.sh destroy.sh`. **Not yet verified**:
-an actual `TARGET=floci STREAM_RAW=kinesis ./deploy.sh` run, or anything against real AWS (gated,
-see above) — this phase's checklist covers implementation correctness, not a live end-to-end run.
+and `terraform validate` in both stacks — `bash -n deploy.sh destroy.sh`.
+
+**Live Floci run, 2026-10-03: both `STREAM_RAW` values confirmed working end to end** —
+`TARGET=floci STREAM_RAW=msk ./deploy.sh` (today's unchanged path, Lambda + Kafka) and
+`TARGET=floci STREAM_RAW=kinesis ./deploy.sh` (Lambda + Kinesis `PutRecord`, native action not
+exercised since that's AWS-only) both confirmed working by the user. The prior deployment (from
+before this phase, still using the old Lambda-on-every-target shape) had to be destroyed from
+`develop` first — `destroy.sh`'s config always has to match what's actually in state, and this
+phase's new `local.infra.raw_stream_name`/etc. references don't exist in an old infra state's
+outputs, so running `destroy.sh` from this branch against that old deployment failed outright
+(`Unsupported attribute`) until done from the matching branch instead.
+
+**Still not verified**: anything on real AWS — the native `kafka`/`kinesis` rule actions, the VPC
+destination, telemetry-processor's new IRSA role. Gated the same way as Phase 5, see above.
 
 ---
 
