@@ -1,12 +1,15 @@
-// Package processor turns raw protobuf telemetry into canonical JSON events.
+// Package processor turns raw protobuf telemetry into canonical JSON events. The raw
+// stream is Kafka or Kinesis depending on STREAM_RAW (see RawConsumer); either way,
+// records of one VIN always share a partition/shard, because IoT Core keys raw
+// records by MQTT client id == VIN.
 //
-// Delivery semantics per poll batch (records of one VIN always share a partition,
-// because IoT Core keys raw records by MQTT client id == VIN):
+// Delivery semantics per poll batch:
 //  1. decode + validate (invalid -> DLQ), drop in-batch duplicates
 //  2. one Redis pipeline: EXISTS dedup key + GET fleet mapping for every record
 //  3. produce canonical events (+ DLQ records) and wait for acks
 //  4. SET dedup keys with TTL
-//  5. commit consumer offsets
+//  5. checkpoint the raw stream (commit Kafka offsets, or save Kinesis sequence
+//     numbers to Redis - see RawConsumer.Checkpoint)
 //
 // Marking dedup keys only after a successful produce means a crash can never
 // drop a message; at worst it is re-emitted, and downstream consumers are
@@ -48,40 +51,35 @@ type Config struct {
 	CanonicalTopic string
 	DLQTopic       string
 	DedupTTL       time.Duration
-	MaxPollRecords int
 }
 
 type Processor struct {
 	cfg Config
-	cl  *kgo.Client
+	raw RawConsumer // reads the raw stream - Kafka or Kinesis, depending on STREAM_RAW
+	cl  *kgo.Client // produces canonical-events/DLQ; always Kafka, regardless of STREAM_RAW
 	rdb *redis.Client
 	log *slog.Logger
 }
 
-func New(cfg Config, cl *kgo.Client, rdb *redis.Client, log *slog.Logger) *Processor {
-	return &Processor{cfg: cfg, cl: cl, rdb: rdb, log: log}
+func New(cfg Config, raw RawConsumer, cl *kgo.Client, rdb *redis.Client, log *slog.Logger) *Processor {
+	return &Processor{cfg: cfg, raw: raw, cl: cl, rdb: rdb, log: log}
 }
 
 func (p *Processor) Run(ctx context.Context) error {
 	for {
-		fetches := p.cl.PollRecords(ctx, p.cfg.MaxPollRecords)
-		if fetches.IsClientClosed() || ctx.Err() != nil {
-			return nil
+		batch, ok := p.raw.Poll(ctx)
+		if !ok {
+			return nil // context cancelled, or the raw consumer stopped for some other reason
 		}
-		fetches.EachError(func(topic string, part int32, err error) {
-			p.log.Error("fetch error", "topic", topic, "partition", part, "err", err)
-		})
-		recs := fetches.Records()
-		if len(recs) > 0 {
+		if len(batch.Records) > 0 {
 			start := time.Now()
 			if err := platform.Retry(ctx, "process batch", func(ctx context.Context) error {
-				return p.processBatch(ctx, recs)
+				return p.processBatch(ctx, batch)
 			}); err != nil {
-				return nil // context cancelled; offsets not committed, batch will be redelivered
+				return nil // context cancelled; not checkpointed, batch will be redelivered
 			}
 			batchSeconds.Observe(time.Since(start).Seconds())
 		}
-		p.cl.AllowRebalance()
 	}
 }
 
@@ -90,7 +88,8 @@ type item struct {
 	dedupKey string
 }
 
-func (p *Processor) processBatch(ctx context.Context, recs []*kgo.Record) error {
+func (p *Processor) processBatch(ctx context.Context, batch RawBatch) error {
+	recs := batch.Records
 	now := time.Now()
 	items := make([]item, 0, len(recs))
 	var out []*kgo.Record
@@ -196,23 +195,28 @@ func (p *Processor) processBatch(ctx context.Context, recs []*kgo.Record) error 
 		recordsTotal.WithLabelValues("published").Add(float64(len(items)))
 	}
 
-	return p.cl.CommitRecords(ctx, recs...)
+	return p.raw.Checkpoint(ctx, batch)
 }
 
-func (p *Processor) dlq(rec *kgo.Record, reason string) *kgo.Record {
+func (p *Processor) dlq(rec RawRecord, reason string) *kgo.Record {
 	return &kgo.Record{
 		Topic: p.cfg.DLQTopic,
 		Key:   rec.Key,
 		Value: rec.Value,
-		Headers: append(append([]kgo.RecordHeader{}, rec.Headers...),
+		Headers: append(toKgoHeaders(rec.Headers),
 			kgo.RecordHeader{Key: "error", Value: []byte(reason)},
-			kgo.RecordHeader{Key: "source_partition", Value: []byte(strconv.Itoa(int(rec.Partition)))},
-			kgo.RecordHeader{Key: "source_offset", Value: []byte(strconv.FormatInt(rec.Offset, 10))}),
+			kgo.RecordHeader{Key: "source_partition", Value: []byte(rec.Partition)},
+			kgo.RecordHeader{Key: "source_offset", Value: []byte(rec.Offset)}),
 	}
 }
 
-// ingestTimestamp prefers the IoT Core rule header (ms since epoch) over the Kafka record timestamp.
-func ingestTimestamp(rec *kgo.Record) int64 {
+// ingestTimestamp prefers the IoT Core rule header (ms since epoch) over the raw
+// record's own transport timestamp. The msk path always has the header (set by the
+// Lambda on Floci, or by the native rule's ${timestamp()} on AWS); the kinesis path
+// never does, since a Kinesis PutRecord has no header concept - it falls through to
+// rec.Timestamp, which is that record's ApproximateArrivalTimestamp (see PLAN.md
+// Phase 7).
+func ingestTimestamp(rec RawRecord) int64 {
 	for _, h := range rec.Headers {
 		if h.Key == "ingest_ts" {
 			if v, err := strconv.ParseInt(string(h.Value), 10, 64); err == nil {

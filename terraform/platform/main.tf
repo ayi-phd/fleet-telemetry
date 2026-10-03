@@ -54,9 +54,11 @@ resource "kubernetes_config_map_v1" "platform" {
   }
   data = {
     AWS_REGION          = local.infra.region
+    STREAM_RAW          = var.stream_raw
     REDIS_ADDR          = local.infra.redis_address
     OPENSEARCH_ENDPOINT = local.infra.opensearch_endpoint
     RAW_TOPIC           = "raw-telemetry"
+    RAW_STREAM_NAME     = local.infra.raw_stream_name
     CANONICAL_TOPIC     = "canonical-events"
     DLQ_TOPIC           = "raw-telemetry-dlq"
     INDEX_PREFIX        = "telemetry"
@@ -76,13 +78,19 @@ locals {
     config_map  = kubernetes_config_map_v1.platform.metadata[0].name
     secret_name = kubernetes_secret_v1.platform.metadata[0].name
   }
+  # telemetry-processor always needs these: producing canonical-events stays on
+  # Kafka regardless of stream_raw (only the raw-side read transport switches - see
+  # PLAN.md Phase 7), so this isn't raw-side-only despite the name.
   kafka_secrets = ["KAFKA_BROKERS", "KAFKA_USERNAME", "KAFKA_PASSWORD"]
-  # OpenSearch credentials for realtime-router and dashboard-api. On AWS these env
-  # vars are omitted entirely so the AWS SDK's default chain falls through to IRSA;
-  # setting them to empty strings there would instead break IRSA outright, since the
-  # SDK treats a present-but-empty AWS_ACCESS_KEY_ID as a (broken) static credential
-  # rather than "unset". No IRSA on Floci (see infra/iam_pods.tf), so it uses these.
-  opensearch_secret_env = local.floci ? ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] : []
+  # Static Floci-local IAM user credentials, standing in wherever a service needs an
+  # AWS SDK client and there's no IRSA to fall back on (see infra/iam_pods.tf - Floci's
+  # EKS emulation has no OIDC identity). On AWS these env vars are omitted entirely so
+  # the AWS SDK's default chain falls through to IRSA; setting them to empty strings
+  # there would instead break IRSA outright, since the SDK treats a present-but-empty
+  # AWS_ACCESS_KEY_ID as a (broken) static credential rather than "unset". Used by
+  # realtime-router/dashboard-api for OpenSearch, and by telemetry-processor for
+  # Kinesis when stream_raw="kinesis" (see its own secret_env below).
+  floci_aws_secret_env = local.floci ? ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] : []
 }
 
 # ---------------- rbac-authz: users, grants, vehicle->fleet master data ----------------
@@ -103,7 +111,7 @@ module "rbac_authz" {
   }
 }
 
-# ---------------- telemetry-processor: raw-telemetry -> canonical-events ----------------
+# ---------------- telemetry-processor: raw stream -> canonical-events ----------------
 module "telemetry_processor" {
   source        = "./modules/service"
   name          = "telemetry-processor"
@@ -113,17 +121,35 @@ module "telemetry_processor" {
   image         = local.image["telemetry-processor"]
   replicas      = local.replicas.telemetry_processor
   node_selector = { workload = "core" }
-  secret_env    = concat(local.kafka_secrets, ["REDIS_PASSWORD"])
-  env = {
-    CONSUMER_GROUP   = "telemetry-processor"
-    DEDUP_TTL        = "1h"
-    TOPIC_PARTITIONS = "6"
-    TOPIC_RETENTION  = "72h"
-    # Floci's MSK emulation has a single broker: replication (and so min.insync.replicas)
-    # can't exceed 1 there.
-    TOPIC_REPLICATION         = local.floci ? "1" : "3"
-    TOPIC_MIN_INSYNC_REPLICAS = local.floci ? "1" : "2"
-  }
+  # Only bound to an IAM role when it actually needs AWS permissions (reading the
+  # Kinesis stream) - unlike realtime-router/dashboard-api, which always need
+  # OpenSearch access regardless of target. See infra/iam_pods.tf.
+  create_service_account = var.stream_raw == "kinesis" && !local.floci
+  service_account_annotations = var.stream_raw == "kinesis" && !local.floci ? {
+    "eks.amazonaws.com/role-arn" = local.infra.telemetry_processor_role_arn
+  } : {}
+  secret_env = concat(
+    local.kafka_secrets,
+    ["REDIS_PASSWORD"],
+    local.floci && var.stream_raw == "kinesis" ? local.floci_aws_secret_env : []
+  )
+  env = merge(
+    {
+      CONSUMER_GROUP   = "telemetry-processor"
+      DEDUP_TTL        = "1h"
+      TOPIC_PARTITIONS = "6"
+      TOPIC_RETENTION  = "72h"
+      # Floci's MSK emulation has a single broker: replication (and so min.insync.replicas)
+      # can't exceed 1 there.
+      TOPIC_REPLICATION         = local.floci ? "1" : "3"
+      TOPIC_MIN_INSYNC_REPLICAS = local.floci ? "1" : "2"
+    },
+    # Floci serves Kinesis from its central gateway container, not a per-service
+    # endpoint; real AWS needs no override (default SDK endpoint resolution applies).
+    local.floci && var.stream_raw == "kinesis" ? {
+      AWS_ENDPOINT_URL_KINESIS = local.infra.raw_stream_endpoint
+    } : {}
+  )
   # Fleet lookups need rbac-authz's initial Redis sync.
   depends_on = [module.rbac_authz]
 }
@@ -145,7 +171,7 @@ module "realtime_router" {
   service_account_annotations = local.floci ? {} : {
     "eks.amazonaws.com/role-arn" = local.infra.realtime_router_role_arn
   }
-  secret_env = concat(local.kafka_secrets, local.opensearch_secret_env)
+  secret_env = concat(local.kafka_secrets, local.floci_aws_secret_env)
   env = {
     PUSH_GROUP    = "realtime-router-push"
     PERSIST_GROUP = "realtime-router-persist"
@@ -168,7 +194,7 @@ module "dashboard_api" {
   service_account_annotations = local.floci ? {} : {
     "eks.amazonaws.com/role-arn" = local.infra.dashboard_api_role_arn
   }
-  secret_env    = concat(["JWT_SIGNING_KEY"], local.opensearch_secret_env)
+  secret_env    = concat(["JWT_SIGNING_KEY"], local.floci_aws_secret_env)
   node_selector = { workload = "edge" }
   tolerations   = [{ key = "dedicated", value = "edge", effect = "NoSchedule" }]
   env = {

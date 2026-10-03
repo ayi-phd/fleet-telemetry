@@ -1,7 +1,16 @@
 # iot-kafka-bridge: the container-image Lambda IoT Core invokes for every telemetry
-# message. It reads only the VIN and republishes the original protobuf bytes to MSK,
-# unmodified, keyed by VIN (see services/cmd/iot-kafka-bridge and PLAN.md Phase 1).
+# message, on Floci only (see terraform/platform/iot.tf and PLAN.md Phase 7). Real
+# AWS's IoT rule engine evaluates substitution templates correctly, so it routes
+# directly into the raw stream with a native rule action instead - no Lambda needed
+# there, for either stream_raw value. Floci's rule engine runs native actions but
+# never evaluates substitution templates (confirmed live: ${clientid()}/${topic()}
+# both arrive as the literal, unevaluated string), so it still needs this Lambda to
+# decode the protobuf itself and get the VIN as a key.
+#
+# Reads only the VIN and republishes the original protobuf bytes unmodified, keyed by
+# VIN, to whichever raw stream STREAM_RAW selects (see services/cmd/iot-kafka-bridge).
 data "aws_iam_policy_document" "lambda_assume" {
+  count = local.floci ? 1 : 0
   statement {
     actions = ["sts:AssumeRole"]
     principals {
@@ -12,96 +21,57 @@ data "aws_iam_policy_document" "lambda_assume" {
 }
 
 resource "aws_iam_role" "iot_kafka_bridge" {
+  count              = local.floci ? 1 : 0
   name               = "${local.project}-iot-kafka-bridge"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume[0].json
 }
 
-# On AWS the function runs inside the VPC to reach MSK privately, which needs ENI
-# permissions. Floci does not attach the function to a VPC, so it only needs log access.
-resource "aws_iam_role_policy_attachment" "iot_kafka_bridge_vpc" {
-  count      = local.floci ? 0 : 1
-  role       = aws_iam_role.iot_kafka_bridge.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
-}
-
+# No VPC attachment needed any more: this Lambda only runs on Floci now, and Floci
+# never attaches Lambdas to a VPC (see PLAN.md Phase 3/4). Real AWS's former need for
+# VPC access (to reach MSK privately) no longer applies, since AWS doesn't run this
+# Lambda at all - the native kafka rule action's own VPC destination (iot.tf) replaces
+# it. The on-failure SQS destination and its event-invoke-config were AWS-only for the
+# same reason and are removed entirely here, not just gated off.
 resource "aws_iam_role_policy_attachment" "iot_kafka_bridge_logs" {
   count      = local.floci ? 1 : 0
-  role       = aws_iam_role.iot_kafka_bridge.name
+  role       = aws_iam_role.iot_kafka_bridge[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-resource "aws_security_group" "iot_kafka_bridge" {
-  count       = local.floci ? 0 : 1
-  name_prefix = "${local.project}-iot-kafka-bridge-"
-  description = "iot-kafka-bridge Lambda ENIs reaching MSK"
-  vpc_id      = local.infra.vpc_id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  lifecycle { create_before_destroy = true }
-}
-
-# Async IoT invocations that exhaust their retries land here instead of being lost.
-# AWS-only: Floci's Lambda emulation is not expected to support event destinations.
-resource "aws_sqs_queue" "iot_kafka_bridge_dlq" {
-  count                     = local.floci ? 0 : 1
-  name                      = "${local.project}-iot-kafka-bridge-dlq"
-  message_retention_seconds = 1209600 # 14 days
-}
-
-resource "aws_iam_role_policy" "iot_kafka_bridge_dlq" {
-  count = local.floci ? 0 : 1
-  role  = aws_iam_role.iot_kafka_bridge.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["sqs:SendMessage"]
-      Resource = aws_sqs_queue.iot_kafka_bridge_dlq[0].arn
-    }]
-  })
-}
-
 resource "aws_lambda_function" "iot_kafka_bridge" {
+  count         = local.floci ? 1 : 0
   function_name = "${local.project}-iot-kafka-bridge"
-  role          = aws_iam_role.iot_kafka_bridge.arn
+  role          = aws_iam_role.iot_kafka_bridge[0].arn
   package_type  = "Image"
   image_uri     = local.image["iot-kafka-bridge"]
   architectures = ["arm64"]
   timeout       = 10
   memory_size   = 256
 
-  dynamic "vpc_config" {
-    for_each = local.floci ? [] : [1]
-    content {
-      subnet_ids         = local.infra.private_subnet_ids
-      security_group_ids = [aws_security_group.iot_kafka_bridge[0].id]
-    }
-  }
-
   environment {
-    variables = {
-      RAW_TOPIC         = "raw-telemetry"
-      KAFKA_BROKERS     = local.infra.msk_bootstrap_brokers
-      KAFKA_USERNAME    = local.infra.msk_username
-      KAFKA_PASSWORD    = local.infra.msk_password
-      KAFKA_TLS         = local.floci ? "false" : "true"
-      LOG_LEVEL         = "info"
-      FLOCI_EXTRA_HOSTS = var.floci_extra_hosts
-    }
-  }
-}
-
-resource "aws_lambda_function_event_invoke_config" "iot_kafka_bridge" {
-  count         = local.floci ? 0 : 1
-  function_name = aws_lambda_function.iot_kafka_bridge.function_name
-  destination_config {
-    on_failure {
-      destination = aws_sqs_queue.iot_kafka_bridge_dlq[0].arn
-    }
+    variables = merge(
+      {
+        STREAM_RAW        = var.stream_raw
+        RAW_TOPIC         = "raw-telemetry"
+        RAW_STREAM_NAME   = local.infra.raw_stream_name
+        KAFKA_BROKERS     = local.infra.msk_bootstrap_brokers
+        KAFKA_USERNAME    = local.infra.msk_username
+        KAFKA_PASSWORD    = local.infra.msk_password
+        KAFKA_TLS         = "false" # this Lambda only ever runs on Floci now
+        LOG_LEVEL         = "info"
+        FLOCI_EXTRA_HOSTS = var.floci_extra_hosts
+      },
+      # Kinesis mode needs an AWS SDK client: Floci has no IRSA (see infra/iam_pods.tf),
+      # so it authenticates with the same static Floci-local IAM user's credentials
+      # used elsewhere (see main.tf's floci_aws_secret_env), and needs an explicit
+      # endpoint override since Floci serves Kinesis from its central gateway
+      # container, not a per-service endpoint.
+      var.stream_raw == "kinesis" ? {
+        AWS_ACCESS_KEY_ID        = var.floci_deploy_access_key_id
+        AWS_SECRET_ACCESS_KEY    = var.floci_deploy_secret_access_key
+        AWS_ENDPOINT_URL_KINESIS = local.infra.raw_stream_endpoint
+        AWS_REGION               = local.infra.region
+      } : {}
+    )
   }
 }

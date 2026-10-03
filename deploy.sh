@@ -8,6 +8,7 @@
 #
 # Settings (environment variables, all optional):
 #   TARGET               "aws" or "floci"                       (default: aws)
+#   STREAM_RAW           "msk" or "kinesis" - the IoT Core -> raw-stream hop (default: msk)
 #   AWS_REGION           Region to deploy into                 (default: us-west-2, or Floci's)
 #   AWS_PROFILE          Standard AWS CLI profile selection (TARGET=aws only)
 #   PROJECT              Name prefix for every resource         (default: fleet-telemetry)
@@ -30,6 +31,7 @@ SERVICES=(telemetry-processor realtime-router dashboard-api rbac-authz vehicle-s
 LAMBDA_SERVICES=(iot-kafka-bridge) # built with --target runtime-lambda; not a Kubernetes Deployment
 
 TARGET="${TARGET:-aws}"
+STREAM_RAW="${STREAM_RAW:-msk}"
 PROJECT="${PROJECT:-fleet-telemetry}"
 # -upgrade makes `terraform init` re-check the module registry over the network on every
 # run, even when an already-cached copy satisfies the version constraint - real work only
@@ -52,6 +54,8 @@ info() { printf '    %s\n' "$*"; }
 warn() { printf '    \033[1;33m%s\033[0m\n' "$*"; }
 die()  { printf '\n\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 trap 'die "deploy stopped at line $LINENO. Fix the problem above and run ./deploy.sh again; finished steps are skipped."' ERR
+
+[[ "$STREAM_RAW" == "msk" || "$STREAM_RAW" == "kinesis" ]] || die "STREAM_RAW must be \"msk\" or \"kinesis\", got \"$STREAM_RAW\"."
 
 tf() { terraform -chdir="$1" "${@:2}"; }
 
@@ -261,6 +265,7 @@ cat > "$INFRA/deploy.auto.tfvars.json" <<EOF
   "region": "$AWS_REGION",
   "project": "$PROJECT",
   "target": "$TARGET",
+  "stream_raw": "$STREAM_RAW",
   "create_opensearch_service_linked_role": $create_slr$allowed_json$iot_endpoint_json$k3s_image_dir_json
 }
 EOF
@@ -456,7 +461,8 @@ fi
 cat > "$PLATFORM/deploy.auto.tfvars.json" <<EOF
 {
   "image_tag": "$IMAGE_TAG",
-  "target": "$TARGET"$floci_creds_json
+  "target": "$TARGET",
+  "stream_raw": "$STREAM_RAW"$floci_creds_json
 }
 EOF
 tf "$PLATFORM" init -input=false $INIT_UPGRADE_FLAG >/dev/null

@@ -16,8 +16,9 @@ Everything runs on AWS and is created by one script and removed by another:
 ```mermaid
 flowchart LR
   V[Vehicles<br/>protobuf over MQTT] -->|fleet/telemetry| IOT[IoT Core<br/>topic rule]
-  IOT -->|invoke| LAM[iot-kafka-bridge<br/>Lambda]
-  LAM -->|raw-telemetry| K1[(MSK)]
+  IOT -->|Floci: invoke| LAM[iot-kafka-bridge<br/>Lambda, Floci only]
+  IOT -->|AWS: native rule action| K1
+  LAM -->|raw stream| K1[(MSK or Kinesis,<br/>STREAM_RAW)]
   K1 --> TP[telemetry-processor]
   TP <-->|dedup + VIN→fleet| R[(ElastiCache Redis)]
   TP -->|canonical-events| K2[(MSK)]
@@ -33,16 +34,23 @@ flowchart LR
 1. **Vehicles** publish a `telemetry.v1.VehicleTelemetry` protobuf (`proto/telemetry/v1`) to
    `fleet/telemetry`. Each vehicle is an IoT thing with its own X.509 certificate; the IoT policy
    lets a device connect only under its own thing name and publish only to that topic.
-2. **IoT Core** invokes the **iot-kafka-bridge** Lambda for every message (a topic rule with a
-   Lambda action; Floci's IoT rules can invoke Lambda but have no native Kafka action, so both
-   targets use the same path). The function reads only the VIN, then republishes the original
-   protobuf bytes to Kafka topic `raw-telemetry` unmodified, keyed by VIN so each vehicle's
-   reports stay in one partition, with an `ingest_ts` header set to the receive time. Failed
-   rule deliveries are logged to CloudWatch; exhausted async retries land in a dead-letter
-   queue. Two accepted trade-offs: the Kafka key no longer proves which device sent a message
-   (on AWS the IoT policy still binds each connection to its own thing), and async retries can
-   reorder a vehicle's reports, which telemetry-processor's deduplication and the dashboard's
-   newest-`deviceTimestamp`-per-VIN handling both tolerate.
+2. **IoT Core** routes every message into the raw stream — **MSK or Kinesis, picked by
+   `STREAM_RAW`** (default `msk`). On **Floci**, the topic rule always invokes the
+   **iot-kafka-bridge** Lambda: Floci's rule engine runs native rule actions but never evaluates
+   IoT SQL substitution templates (confirmed live — `${clientid()}` and `${topic()}` both arrive
+   as the literal, unevaluated string), so it can't get the VIN as a key without the Lambda
+   decoding the protobuf itself. The function reads only the VIN, then republishes the original
+   bytes unmodified — to Kafka topic `raw-telemetry` (keyed by VIN, `ingest_ts` header set to the
+   receive time) or to the Kinesis stream (VIN as the partition key, no header — the consumer
+   uses the record's own arrival timestamp instead). On **AWS**, there's no Lambda at all: the
+   topic rule writes directly into the raw stream via a native rule action (`kafka`, behind a VPC
+   destination, SASL/SCRAM; or `kinesis`), keyed the same way via `${clientid()}` (the simulator's
+   MQTT client ID is the VIN) — real AWS does evaluate that substitution. Failed rule deliveries
+   are logged to CloudWatch; on the Floci/Lambda path, exhausted async retries land in a
+   dead-letter queue. Two accepted trade-offs: the raw-stream key no longer proves which device
+   sent a message (on AWS the IoT policy still binds each connection to its own thing), and async
+   retries can reorder a vehicle's reports, which telemetry-processor's deduplication and the
+   dashboard's newest-`deviceTimestamp`-per-VIN handling both tolerate.
 3. **telemetry-processor** decodes and validates each message, drops duplicates using Redis,
    looks up the vehicle's fleet in Redis, and publishes JSON to `canonical-events`.
    Invalid messages go to `raw-telemetry-dlq`. Vehicles with no fleet are tagged `UNASSIGNED`.
@@ -232,8 +240,10 @@ own, even with a matching lock file and an already-downloaded provider.
 
 What's different on Floci, all switched by the same `target` Terraform variable: one broker
 each for MSK, ElastiCache and OpenSearch, no NAT gateway, no EKS node groups (k3s runs every
-pod on its single node), plaintext Kafka and Redis, one replica per service, and the
-dashboard reachable by port-forward instead of a load balancer:
+pod on its single node), plaintext Kafka and Redis, one replica per service, the
+iot-kafka-bridge Lambda in the raw-ingestion path (AWS routes natively instead, see above), and
+the dashboard reachable by port-forward instead of a load balancer. `STREAM_RAW=msk|kinesis`
+(default `msk`) works the same way on both targets:
 
 ```bash
 kubectl -n fleet port-forward svc/web 8080:80   # deploy.sh prints this exact command
@@ -246,7 +256,9 @@ TARGET=floci ./destroy.sh   # Floci itself keeps running
 ```
 
 The full pipeline (simulator → IoT → Lambda → MSK → dashboard) has been verified working
-end to end on Floci, including permission filtering across two different users. Getting
+end to end on Floci, including permission filtering across two different users (the
+`STREAM_RAW=kinesis`/no-Lambda-on-AWS path is new and not yet verified against a live Floci or
+AWS run). Getting
 there took working around a long list of real Floci-side bugs and gaps, one at a time —
 see below.
 
